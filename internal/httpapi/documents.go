@@ -274,6 +274,92 @@ func (s *Server) updateDocument(c *gin.Context) {
 	c.JSON(http.StatusOK, doc)
 }
 
+// DELETE /api/v1/documents/:id
+//
+// 移入回收站（软删除）：只改标记位，磁盘上的原文件与已建好的索引都不动。
+// 因此恢复之后立刻就能被搜到，不需要重跑一遍索引。
+//
+// 不做二次确认是刻意的：这一步可以撤销，多一个弹窗只会让用户对着一个
+// 随时能反悔的操作犹豫。真正会丢东西的是彻底删除，那一个才需要拦一下。
+func (s *Server) deleteDocument(c *gin.Context) {
+	doc, err := s.store.SoftDeleteDocument(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		s.respondLoadError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, doc)
+}
+
+// POST /api/v1/documents/:id/restore
+//
+// 从回收站恢复。归档状态保持删除前的样子：删除期间没人动过它，
+// 恢复就是回到原来的那一边，而不是一律回到「使用中」。
+func (s *Server) restoreDocument(c *gin.Context) {
+	doc, err := s.store.RestoreFromTrash(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		s.respondLoadError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, doc)
+}
+
+// DELETE /api/v1/documents/:id/purge
+//
+// 彻底删除：从库里删掉记录（片段与索引任务随外键一起消失），再清理磁盘目录。
+//
+// 顺序是先删库、后删盘，且删盘失败不回滚、不报错。盘上留下的孤儿目录没有任何
+// 记录指向它，最坏只是占地方；而一旦反过来，删盘成功但删库失败，库里那条记录
+// 会变成点下载必报「原文件已丢失」的坏数据 —— 那是用户看得见的故障。
+func (s *Server) purgeDocument(c *gin.Context) {
+	doc, err := s.store.PurgeDocument(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if errors.Is(err, store.ErrNotTrashed) {
+			fail(c, http.StatusConflict, codeConflict,
+				"该文件不在回收站里；彻底删除不可恢复，请先把它移入回收站")
+			return
+		}
+		s.respondLoadError(c, err)
+		return
+	}
+	s.purgeFiles([]store.Document{*doc})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("「%s」已彻底删除", doc.Name),
+	})
+}
+
+// DELETE /api/v1/trash
+//
+// 清空回收站。库里一次删完，磁盘逐个目录清理 —— 同样允许个别目录清理失败，
+// 理由与 purgeDocument 相同：记录已经没了，对用户而言文件确实已经删掉。
+func (s *Server) emptyTrash(c *gin.Context) {
+	docs, err := s.store.PurgeAllTrashed(c.Request.Context())
+	if err != nil {
+		failInternal(c, err)
+		return
+	}
+	s.purgeFiles(docs)
+
+	c.JSON(http.StatusOK, gin.H{
+		"purged":  len(docs),
+		"message": fmt.Sprintf("已清空回收站，%d 个文件被彻底删除", len(docs)),
+	})
+}
+
+// purgeFiles 尽力清理这些记录对应的磁盘目录。
+//
+// 失败只记日志、不往外报：库里的记录已经删掉了，这一步失败留下的是一个谁也不引用
+// 的目录。把一次已经完成的删除报成失败，会让用户反复重试一个无事可做的动作，
+// 而他重试时看到的仍然是「文件不在了」——两次提示互相矛盾，比一个孤儿目录更糟。
+func (s *Server) purgeFiles(docs []store.Document) {
+	for _, doc := range docs {
+		if err := s.storage.RemoveMany(doc.DocUID); err != nil {
+			slog.Error("彻底删除后清理磁盘目录失败，留下孤儿目录",
+				"docUID", doc.DocUID, "err", err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------- 辅助函数
 
 // parseListFilter 解析列表与检索共用的筛选参数，失败时已写好 400 响应。
@@ -281,6 +367,7 @@ func parseListFilter(c *gin.Context) (store.ListFilter, bool) {
 	f := store.ListFilter{
 		Query:    strings.TrimSpace(c.Query("q")),
 		Archived: c.Query("archived") == "true",
+		Trashed:  c.Query("trashed") == "true",
 		Page:     atoiDefault(c.Query("page"), 1),
 		PageSize: atoiDefault(c.Query("pageSize"), 20),
 	}

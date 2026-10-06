@@ -174,6 +174,33 @@ test('归档：从“使用中”消失，进入“已归档”，再恢复', as
   await expect(rowOf(page, MD)).toBeVisible()
 })
 
+/**
+ * 删除的第一步。
+ *
+ * 盯的是「删除到底能不能反悔」：移入回收站是随时可撤销的动作，
+ * 所以它不弹确认框，但必须把撤销入口放在用户正看着的那条提示上 ——
+ * 让人跑去别处找撤销，等于没给这个机会。
+ * 用例结束把文件放回「使用中」，后面的用例仍按它存在来断言。
+ */
+test('删除：移入回收站，提示里的「撤销」能把它放回「使用中」', async ({ page }) => {
+  await page.goto('/documents')
+  // 「彻底删除」只属于回收站，使用中的行上不该出现
+  await expect(rowOf(page, MD).getByRole('button', { name: '彻底删除' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '清空回收站' })).toHaveCount(0)
+
+  await rowOf(page, MD).getByRole('button', { name: '删除' }).click()
+
+  const toast = page.locator('.el-message').filter({ hasText: `「${MD}」已移入回收站` })
+  await expect(toast).toBeVisible()
+  // 点行内按钮不应顺带把详情抽屉打开
+  await expect(page.locator('.el-drawer')).toBeHidden()
+  await expect(rowOf(page, MD)).toHaveCount(0)
+
+  await toast.getByRole('button', { name: '撤销' }).click()
+  await expect(page.getByText(`已恢复「${MD}」`)).toBeVisible()
+  await expect(rowOf(page, MD)).toBeVisible()
+})
+
 test('刷新页面后列表仍在（数据来自数据库而非内存）', async ({ page }) => {
   await page.goto('/documents')
   await expect(rowOf(page, MD)).toBeVisible()
@@ -228,4 +255,47 @@ test('索引失败：状态与原因可见、可重试，且不影响下载', as
   await drawer.getByRole('button', { name: '重新索引' }).click()
   await expect(page.getByText('已提交重新索引')).toBeVisible()
   await expect(drawer.getByText(/待索引|索引中/)).toBeVisible()
+})
+
+/**
+ * 删除的第二步，也是唯一不可逆的一步。
+ *
+ * 用一份一次性的 PDF：它按格式就不参与正文索引，不会引入额外的等待。
+ * 用例自己造文件再自己毁掉，不依赖前面留下的数据。
+ */
+test('回收站：行内只剩恢复与彻底删除，彻底删除要先过确认框', async ({ page }) => {
+  const name = '一次性废弃件.pdf'
+  await page.goto('/documents')
+
+  await page.getByRole('button', { name: '上传文件' }).click()
+  const dialog = page.locator('.el-dialog')
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name,
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4\n% 供彻底删除用例使用\n'),
+  })
+  await dialog.getByRole('button', { name: '开始上传' }).click()
+  await expect(page.getByText(`已上传「${name}」`)).toBeVisible()
+
+  await rowOf(page, name).getByRole('button', { name: '删除' }).click()
+  await page.getByRole('tab', { name: '回收站' }).click()
+
+  const trashed = rowOf(page, name)
+  await expect(trashed).toBeVisible()
+  await expect(trashed.getByRole('button', { name: '恢复' })).toBeVisible()
+  // 归档 / 取消归档对一份已经删掉的文件没有意义，不该出现在这一行
+  await expect(trashed.getByRole('button', { name: '归档' })).toHaveCount(0)
+  // 清空回收站只在这个标签页里出现：它一次删空整页，离误点太近
+  await expect(page.getByRole('button', { name: '清空回收站' })).toBeVisible()
+
+  const box = page.locator('.el-message-box')
+  await trashed.getByRole('button', { name: '彻底删除' }).click()
+  await expect(box).toBeVisible()
+  // 不可逆的动作不能只问一句「确定吗」，要说清后果是什么
+  await expect(box).toContainText('无法恢复')
+  await box.getByRole('button', { name: '永久删除' }).click()
+
+  await expect(page.getByText(`已彻底删除「${name}」`)).toBeVisible()
+  await expect(rowOf(page, name)).toHaveCount(0)
+  await expect(page.getByText('回收站是空的')).toBeVisible()
 })

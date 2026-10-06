@@ -140,6 +140,35 @@ def upload(name: str, fields: dict | None = None):
     )
 
 
+def upload_raw(name: str, data: bytes, fields: dict | None = None):
+    """上传一份现造的内容，不从语料目录读。
+
+    删除相关的用例必须自造样本：语料是端到端用例也在用的共享数据，
+    在这里把它删掉，别的用例会找不到文件，而失败会报在别处。
+    """
+    return call(
+        "POST",
+        "/documents",
+        files={"file": (name, data, "application/octet-stream")},
+        fields=fields,
+    )
+
+
+def upload_dir_exists(doc_uid: str) -> bool:
+    """磁盘上这个文档的目录还在不在。
+
+    接口只能证明「库里的记录没了」，证明不了「盘上的字节也清掉了」，
+    而后者才是彻底删除与移入回收站的区别所在，所以必须进容器看一次。
+    """
+    result = subprocess.run(
+        ["docker", "compose", *COMPOSE_ARGS, "exec", "-T", "api",
+         "sh", "-c", f"test -d /data/uploads/{doc_uid} && echo yes || echo no"],
+        capture_output=True,
+        cwd=REPO_ROOT,
+    )
+    return result.stdout.decode("utf-8", "replace").strip() == "yes"
+
+
 def sql(query: str) -> str:
     """直接查库，用于验证“不该落库的确实没落库”这类界面看不到的断言。"""
     result = subprocess.run(
@@ -756,6 +785,131 @@ def main() -> int:
     _, back, _ = call("GET", "/search?q=" + urllib.parse.quote("发布检查清单"))
     chk("恢复后重新出现在检索结果里",
         any(it["document"]["id"] == target for it in back["items"]), True)
+
+    # 删除分两步：DELETE 是移入回收站（可撤销），/purge 才是真的抹掉。
+    # 这一节要验的是这两步各自做到了什么，以及它们之间那道「必须先经过回收站」的闸门。
+    print("== 28. 删除：回收站、恢复与彻底删除 ==")
+    sample_name = "回收站用例-待删除.md"
+    # 关键字用自造词，避免撞上语料里本来就有的内容而让检索断言失去意义
+    sample_body = (
+        "# 回收站用例\n\n"
+        "这一段正文用来确认删除后的文件不会被检索命中。\n"
+        "关键词：蓝鲸备份策略。\n"
+    ).encode("utf-8")
+
+    status, sample, _ = upload_raw(sample_name, sample_body)
+    chk("上传样本 201", status, 201)
+    uid = sample["id"]
+    pk = doc_pk(uid)
+
+    # 等索引落定再往下走：本节要验「恢复后立刻就能搜到」，
+    # 如果删除时它还在排队，那恢复后搜不到就分不清是删除的问题还是索引没跑完。
+    chk("样本索引完成", wait_index(uid, {"ready"}), "ready")
+
+    _, active, _ = call("GET", "/documents?pageSize=100")
+    chk("删除前在使用中列表里", any(d["id"] == uid for d in active["items"]), True)
+    _, hits, _ = call("GET", "/search?q=" + urllib.parse.quote("蓝鲸备份策略"))
+    chk("删除前能被关键词检索到", any(it["document"]["id"] == uid for it in hits["items"]), True)
+    _, sem_before, _ = call("POST", "/search/semantic",
+                            json_body={"query": "蓝鲸备份策略是什么", "topK": 10})
+    chk("删除前能被语义检索到",
+        any(it["document"]["id"] == uid for it in sem_before["items"]), True)
+
+    status, deleted, _ = call("DELETE", f"/documents/{uid}")
+    chk("移入回收站 200", status, 200)
+    chk("  返回的记录带上了删除时间", deleted["deletedAt"] is not None, True)
+    # 软删除必须留着行：删掉行就没法恢复，也没法解释「它去哪了」
+    chk("  行还在，只是标记位变了",
+        sql(f"SELECT (deleted_at IS NOT NULL)::text FROM documents WHERE doc_uid = '{uid}'"), "true")
+
+    _, active, _ = call("GET", "/documents?pageSize=100")
+    chk("从使用中列表消失", any(d["id"] == uid for d in active["items"]), False)
+    _, trash, _ = call("GET", "/documents?pageSize=100&trashed=true")
+    chk("出现在回收站列表", any(d["id"] == uid for d in trash["items"]), True)
+    _, archived_list, _ = call("GET", "/documents?pageSize=100&archived=true")
+    chk("不出现在归档区", any(d["id"] == uid for d in archived_list["items"]), False)
+
+    # 删掉的文件还能被搜出来，比没有删除功能更糟：用户会认为删除根本没生效。
+    # 三种取数入口（列表 / 关键词 / 语义）都要过一遍。
+    _, hits, _ = call("GET", "/search?q=" + urllib.parse.quote("蓝鲸备份策略"))
+    chk("删除后不出现在关键词检索里", any(it["document"]["id"] == uid for it in hits["items"]), False)
+    _, hits, _ = call("GET", "/search?q=" + urllib.parse.quote(sample_name))
+    chk("按文件名也搜不到", any(it["document"]["id"] == uid for it in hits["items"]), False)
+    _, sem_after, _ = call("POST", "/search/semantic",
+                           json_body={"query": "蓝鲸备份策略是什么", "topK": 10})
+    chk("删除后不出现在语义检索里",
+        any(it["document"]["id"] == uid for it in sem_after["items"]), False)
+
+    # 「移入回收站」不是把东西搬走：详情、下载、索引都还在，这正是它能被恢复的前提
+    status, detail, _ = call("GET", f"/documents/{uid}")
+    chk("回收站里仍能看详情",
+        (status, detail["indexStatus"], detail["deletedAt"] is not None), (200, "ready", True))
+    status, blob, _ = call("GET", f"/documents/{uid}/download")
+    chk("回收站里仍能下载，内容逐字节一致", (status, blob), (200, sample_body))
+    chk("磁盘上的原文件仍在", upload_dir_exists(uid), True)
+
+    status, restored, _ = call("POST", f"/documents/{uid}/restore")
+    chk("恢复 200", status, 200)
+    chk("  deletedAt 已清空", restored["deletedAt"], None)
+    _, active, _ = call("GET", "/documents?pageSize=100")
+    chk("恢复到使用中列表", any(d["id"] == uid for d in active["items"]), True)
+    # 删除没有动过索引，所以恢复之后不必等重建 —— 等的话这条断言就失去意义了
+    _, hits, _ = call("GET", "/search?q=" + urllib.parse.quote("蓝鲸备份策略"))
+    chk("恢复后立刻能被检索到", any(it["document"]["id"] == uid for it in hits["items"]), True)
+
+    # 彻底删除不可恢复，所以它只对回收站里的文件生效。
+    # 这道闸门是误删唯一能停下来的地方，值得单独验一次。
+    status, err, _ = call("DELETE", f"/documents/{uid}/purge")
+    chk("对未删除的文件彻底删除被拒绝", status, 409)
+    chk("  错误码是状态冲突而非参数错误", err["code"], "conflict")
+    chk("  文件原封不动", call("GET", f"/documents/{uid}")[0], 200)
+
+    call("DELETE", f"/documents/{uid}")
+    status, gone, _ = call("DELETE", f"/documents/{uid}/purge")
+    chk("彻底删除 200", status, 200)
+    chk("  记录已消失", call("GET", f"/documents/{uid}")[0], 404)
+    chk("磁盘目录已清理", upload_dir_exists(uid), False)
+    # 片段与任务靠外键级联，这里确认它们真的跟着走了，而不是被留在库里
+    chk("片段随外键级联删除",
+        sql(f"SELECT count(*) FROM document_chunks WHERE document_id = {pk}"), "0")
+    chk("索引任务随外键级联删除",
+        sql(f"SELECT count(*) FROM index_jobs WHERE document_id = {pk}"), "0")
+
+    # 清空回收站。返回的条数必须是真数出来的 —— 界面拿它告诉用户「删掉了几个」，
+    # 写死或按当前页凑数都会在分页与筛选下说错话。
+    bulk_uids = []
+    for i in (1, 2):
+        _, d, _ = upload_raw(f"回收站用例-批量{i}.md", f"# 批量 {i}\n\n内容 {i}\n".encode("utf-8"))
+        bulk_uids.append(d["id"])
+        call("DELETE", f"/documents/{d['id']}")
+
+    status, result, _ = call("DELETE", "/trash")
+    chk("清空回收站 200", status, 200)
+    chk("  返回的条数是实际删掉的两份", result["purged"], 2)
+    _, trash, _ = call("GET", "/documents?pageSize=100&trashed=true")
+    chk("回收站已空", [d["id"] for d in trash["items"] if d["id"] in bulk_uids], [])
+    chk("两份的磁盘目录都已清理", [upload_dir_exists(u) for u in bulk_uids], [False, False])
+
+    # 归档与删除是两个独立的位：一份归档文件被删掉，恢复时应当回到「已归档」
+    # 而不是「使用中」。用一个布尔位表达两种含义，就会在这里丢掉用户原本的判断。
+    _, keep, _ = upload_raw("回收站用例-归档后再删.md", "# 归档后再删\n".encode("utf-8"))
+    keep_uid = keep["id"]
+    call("PATCH", f"/documents/{keep_uid}", json_body={"archived": True})
+    call("DELETE", f"/documents/{keep_uid}")
+    _, archived_list, _ = call("GET", "/documents?pageSize=100&archived=true")
+    chk("归档文件删除后也从归档区消失",
+        any(d["id"] == keep_uid for d in archived_list["items"]), False)
+
+    status, restored, _ = call("POST", f"/documents/{keep_uid}/restore")
+    chk("恢复后归档状态保持不变",
+        (status, restored["archived"], restored["deletedAt"]), (200, True, None))
+    _, archived_list, _ = call("GET", "/documents?pageSize=100&archived=true")
+    chk("  回到归档区而不是使用中",
+        any(d["id"] == keep_uid for d in archived_list["items"]), True)
+
+    # 收尾：把它清掉，免得给后面按「使用中」计数的用例留下一个额外的文件
+    call("DELETE", f"/documents/{keep_uid}")
+    call("DELETE", f"/documents/{keep_uid}/purge")
 
     print(f"\n结果：PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0

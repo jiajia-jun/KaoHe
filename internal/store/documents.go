@@ -13,6 +13,13 @@ import (
 // ErrNotFound 表示目标记录不存在，由 HTTP 层翻译成 404。
 var ErrNotFound = errors.New("记录不存在")
 
+// ErrNotTrashed 表示要对一份不在回收站里的文件做彻底删除。
+//
+// 彻底删除没有后悔药，所以它只允许在回收站里进行 —— 想毁掉一份正在用的文件，
+// 必须先「移入回收站」再「彻底删除」两步。多出来的这一步不是仪式：
+// 它保证误删永远有一步可以停下来。
+var ErrNotTrashed = errors.New("文件不在回收站里")
+
 // Store 是全部数据访问的入口：文档与分类走 GORM，
 // 检索、分类树、索引任务队列走原生 SQL（见 docs/DESIGN.md 的关键取舍）。
 type Store struct{ db *gorm.DB }
@@ -45,6 +52,9 @@ type ListFilter struct {
 	OnlyUncategorized bool
 	// Archived 为 false 时只返回未归档文档，这是默认列表的语义
 	Archived bool
+	// Trashed 为 true 时只返回回收站里的文件，此时 Archived 不起作用 ——
+	// 删除吞掉了归档这层含义，两个条件叠加会出现「我明明删了它却不在回收站里」。
+	Trashed  bool
 	Page     int
 	PageSize int
 	// SnippetsPerDoc 是每份文档最多取回的命中片段数，仅检索路径使用。
@@ -59,9 +69,17 @@ type ListFilter struct {
 // 拼进去的全是本文件里的常量，用户输入一律走占位符。
 func (f ListFilter) where() (string, []any) {
 	var b strings.Builder
-	args := []any{f.Archived}
+	var args []any
 
-	b.WriteString(" WHERE d.archived = ?")
+	// 默认列表、关键词检索、语义检索都走这一条 where，
+	// 所以把 deleted_at 的判断放在这里，三个入口就都不会漏掉回收站里的文件 ——
+	// 一处漏掉就是「删掉的文件还能被搜出来」，那比没有删除功能更糟。
+	if f.Trashed {
+		b.WriteString(" WHERE d.deleted_at IS NOT NULL")
+	} else {
+		b.WriteString(" WHERE d.deleted_at IS NULL AND d.archived = ?")
+		args = append(args, f.Archived)
+	}
 	if f.Query != "" {
 		if f.BodyMatches {
 			// EXISTS 而不是 JOIN：一份文件正文里出现十次关键词，
@@ -205,6 +223,77 @@ func (s *Store) UpdateDocument(ctx context.Context, docUID string, fields map[st
 		}
 	}
 	return s.GetDocument(ctx, docUID)
+}
+
+// SoftDeleteDocument 把文件移进回收站。
+//
+// 只改标记位：磁盘上的字节与已有的正文片段都不动。这不是偷懒 ——
+// 恢复之后必须立刻能被搜到，如果删除时把片段清掉，恢复就得重跑一遍索引，
+// 而用户眼里「我刚恢复的文件搜不到」和「恢复失败」是分不清的。
+//
+// 对已在回收站里的文件重复调用不会重置时间：进站时间应当是第一次删的时刻，
+// 被重复请求推后会让这个信息失去意义。结果与第一次相同，按成功返回。
+func (s *Store) SoftDeleteDocument(ctx context.Context, docUID string) (*Document, error) {
+	if err := s.db.WithContext(ctx).Exec(`
+UPDATE documents SET deleted_at = now(), updated_at = now()
+WHERE doc_uid = ? AND deleted_at IS NULL`, docUID).Error; err != nil {
+		return nil, fmt.Errorf("移入回收站失败: %w", err)
+	}
+	// 没改到行有两种可能：文件不存在，或者它本来就在回收站里。
+	// 前者由 GetDocument 返回 ErrNotFound，后者原样返回当前记录，两者都能区分开。
+	return s.GetDocument(ctx, docUID)
+}
+
+// RestoreFromTrash 把文件移出回收站。
+//
+// Archived 保持原样：归档状态在删除期间没有被改动过，恢复就是回到删除前的那一边。
+// 同样对重复调用幂等。
+func (s *Store) RestoreFromTrash(ctx context.Context, docUID string) (*Document, error) {
+	if err := s.db.WithContext(ctx).Exec(`
+UPDATE documents SET deleted_at = NULL, updated_at = now()
+WHERE doc_uid = ? AND deleted_at IS NOT NULL`, docUID).Error; err != nil {
+		return nil, fmt.Errorf("从回收站恢复失败: %w", err)
+	}
+	return s.GetDocument(ctx, docUID)
+}
+
+// PurgeDocument 彻底删除一份文件，返回被删掉的那条记录，
+// 调用方据此去清理磁盘上的目录。
+//
+// 只做库里的删除，不碰磁盘：删除顺序与文件清理分开，是为了让「删除」这个动作
+// 在库里是原子的。盘上残留的目录没有任何记录指向它，最坏只是浪费空间；
+// 反过来（先删盘）一旦库里的删除失败，就会留下一条点下载必报「原文件已丢失」的记录。
+//
+// document_chunks 与 index_jobs 上的外键是 ON DELETE CASCADE，随这一行一起消失。
+func (s *Store) PurgeDocument(ctx context.Context, docUID string) (*Document, error) {
+	doc, err := s.GetDocument(ctx, docUID)
+	if err != nil {
+		return nil, err
+	}
+	if doc.DeletedAt == nil {
+		return nil, ErrNotTrashed
+	}
+	if err := s.db.WithContext(ctx).Exec(
+		`DELETE FROM documents WHERE doc_uid = ?`, docUID).Error; err != nil {
+		return nil, fmt.Errorf("彻底删除文件失败: %w", err)
+	}
+	return doc, nil
+}
+
+// PurgeAllTrashed 清空回收站，返回被删掉的全部记录，供调用方清理磁盘目录。
+//
+// 用一条 DELETE ... RETURNING 而不是先查后删：两条语句之间插进来一次软删除，
+// 那份文件就会被漏掉磁盘清理，留下一份孤儿目录而没有任何提示。
+func (s *Store) PurgeAllTrashed(ctx context.Context) ([]Document, error) {
+	var docs []Document
+	if err := s.db.WithContext(ctx).Raw(
+		`DELETE FROM documents WHERE deleted_at IS NOT NULL RETURNING *`).Scan(&docs).Error; err != nil {
+		return nil, fmt.Errorf("清空回收站失败: %w", err)
+	}
+	if docs == nil {
+		docs = []Document{}
+	}
+	return docs, nil
 }
 
 // CategoryExists 校验分类是否有效。上传与移动归属时都要用它，

@@ -42,8 +42,9 @@ type Category struct {
 
 // Document 是一份上传的文件。
 //
-// 注意「文件在不在」与「索引到哪一步了」是两个独立字段：
-// 归档只是把 Archived 置位、字节不动，索引失败也不会动原文件。
+// 注意「文件还在不在」「归不归档」「索引到哪一步了」是三件互不相干的事：
+// 归档与删除都只改标记位、字节不动，索引失败也不会动原文件。
+// 只有彻底删除（清出回收站）才真的从库里删行、从盘上删文件。
 type Document struct {
 	ID int64 `gorm:"primaryKey" json:"-"`
 	// DocUID 是对外标识，接口路径里用它，不暴露自增主键
@@ -57,11 +58,16 @@ type Document struct {
 	CategoryID  *int64         `gorm:"column:category_id" json:"categoryId"`
 	Tags        pq.StringArray `gorm:"column:tags;type:text[]" json:"tags"`
 
-	// Archived 是软状态：文件字节永远不动，只是默认不出现在列表与检索里
-	Archived      bool    `gorm:"column:archived" json:"archived"`
-	StorageStatus string  `gorm:"column:storage_status" json:"storageStatus"`
-	IndexStatus   string  `gorm:"column:index_status" json:"indexStatus"`
-	IndexError    *string `gorm:"column:index_error" json:"indexError"`
+	// Archived 与 DeletedAt 都是软状态，文件字节都不动，区别在语义：
+	// 归档是「暂时不参与日常工作」，删除是「我不要它了」。两者互不覆盖 ——
+	// 一份已归档的文件被删除后，恢复时要能回到「已归档」而不是「使用中」。
+	Archived bool `gorm:"column:archived" json:"archived"`
+	// DeletedAt 非空表示在回收站里。用时间戳而非布尔：
+	// 「什么时候删的」是用户会问的问题，而 IS NOT NULL 照样能当布尔用。
+	DeletedAt     *time.Time `gorm:"column:deleted_at" json:"deletedAt"`
+	StorageStatus string     `gorm:"column:storage_status" json:"storageStatus"`
+	IndexStatus   string     `gorm:"column:index_status" json:"indexStatus"`
+	IndexError    *string    `gorm:"column:index_error" json:"indexError"`
 
 	CreatedAt time.Time `gorm:"column:created_at" json:"createdAt"`
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"updatedAt"`

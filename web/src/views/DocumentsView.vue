@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ElButton, ElMessage, ElMessageBox } from 'element-plus'
 import { errorText } from '@/api/client'
 import {
   archiveDocument,
+  deleteDocument,
+  emptyTrash,
   fetchConfig,
   fetchDocumentBlob,
   isIndexing,
   listDocuments,
+  purgeDocument,
   restoreDocument,
+  restoreFromTrash,
   saveBlob,
   type DocumentItem,
   type ServerConfig,
@@ -39,7 +43,15 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
 const search = ref('')
-const archivedTab = ref<'active' | 'archived'>('active')
+
+/**
+ * 三个标签页对应三种互斥的取数范围，而不是三个可以叠加的筛选条件：
+ * 「使用中」是不归档且没删的，「已归档」是归档且没删的，「回收站」是删掉的。
+ * 一份文件同时只能出现在其中一个里 —— 叠加条件会让它同时属于多个页面，
+ * 用户删掉之后还能在「使用中」看见它，就只能理解成删除失败了。
+ */
+type DocTab = 'active' | 'archived' | 'trash'
+const tab = ref<DocTab>('active')
 
 const categoryKey = ref('all')
 const categories = ref<CategoryNode[]>([])
@@ -54,13 +66,14 @@ const activeId = ref<string | null>(null)
 
 const selection = computed(() => parseCategoryKey(categoryKey.value))
 const hasFilter = computed(
-  () => search.value.trim() !== '' || categoryKey.value !== 'all' || archivedTab.value === 'archived',
+  () => search.value.trim() !== '' || categoryKey.value !== 'all' || tab.value !== 'active',
 )
 const emptyText = computed(() => {
   if (search.value.trim()) return '没有匹配的文件'
   if (categoryKey.value === 'none') return '还没有未分类的文件'
   if (selection.value.mode === 'category') return '这个分类下还没有文件'
-  if (archivedTab.value === 'archived') return '还没有归档的文件'
+  if (tab.value === 'archived') return '还没有归档的文件'
+  if (tab.value === 'trash') return '回收站是空的'
   return '还没有文件，点右上角的上传按钮添加'
 })
 
@@ -89,7 +102,8 @@ async function load(silent = false) {
       q: search.value.trim(),
       categoryId: current.mode === 'category' ? current.id : undefined,
       uncategorized: current.mode === 'none',
-      archived: archivedTab.value === 'archived',
+      archived: tab.value === 'archived',
+      trashed: tab.value === 'trash',
       page: page.value,
       pageSize: pageSize.value,
     })
@@ -171,7 +185,7 @@ watch(categoryKey, () => {
   void load()
 })
 
-watch(archivedTab, () => {
+watch(tab, () => {
   page.value = 1
   void load()
 })
@@ -201,7 +215,8 @@ function openDetail(row: DocumentItem) {
 function onUploaded(doc: DocumentItem) {
   ElMessage.success(`已上传「${doc.name}」`)
   page.value = 1
-  archivedTab.value = 'active'
+  // 新文件一定不在回收站或归档区里，上传完还停在那两个页面会让人以为没传上去
+  tab.value = 'active'
   void load()
   void loadCategories()
 }
@@ -232,6 +247,114 @@ async function download(row: DocumentItem) {
   }
 }
 
+/**
+ * 删除成功后的提示，带一个就地撤销的入口。
+ *
+ * 用 Element Plus 的 message 配渲染函数，而不是引入通知组件：
+ * 撤销就发生在这条提示上，不该再让用户去别处找入口。
+ */
+function notifyTrashed(row: DocumentItem) {
+  const instance = ElMessage({
+    type: 'success',
+    // 比默认的 3 秒长：撤销是要用户做个决定的，一闪而过等于没给这个机会
+    duration: 6000,
+    message: h('div', { style: 'display:flex;align-items:center;gap:12px' }, [
+      h('span', null, `「${row.name}」已移入回收站`),
+      h(
+        ElButton,
+        {
+          text: true,
+          type: 'primary',
+          size: 'small',
+          // 先关掉提示再发请求：撤销失败会另起一条错误提示，
+          // 两条消息叠在一起时，用户分不清哪条说的是当前状态
+          onClick: () => {
+            instance.close()
+            void putBack(row)
+          },
+        },
+        () => '撤销',
+      ),
+    ]),
+  })
+}
+
+/** 移入回收站。不弹确认框：这一步随时可以反悔，拦一道只会让人对着能撤销的操作犹豫。 */
+async function moveToTrash(row: DocumentItem) {
+  try {
+    await deleteDocument(row.id)
+    notifyTrashed(row)
+    void load()
+    void loadCategories()
+  } catch (err) {
+    ElMessage.error(errorText(err))
+  }
+}
+
+/** 从回收站恢复。撤销按钮走的也是这里 —— 两者要做的事完全一样，没有第二套逻辑。 */
+async function putBack(row: DocumentItem) {
+  try {
+    await restoreFromTrash(row.id)
+    ElMessage.success(`已恢复「${row.name}」`)
+    void load()
+    void loadCategories()
+  } catch (err) {
+    ElMessage.error(errorText(err))
+  }
+}
+
+/** 彻底删除单条。这一步不可逆，所以要弹确认，且文案必须说清「无法恢复」。 */
+async function purge(row: DocumentItem) {
+  try {
+    await ElMessageBox.confirm(
+      `「${row.name}」将被永久删除，原文件与已经建立的索引一并消失，无法恢复。`,
+      '彻底删除',
+      {
+        type: 'warning',
+        confirmButtonText: '永久删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger',
+      },
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    await purgeDocument(row.id)
+    ElMessage.success(`已彻底删除「${row.name}」`)
+    void load()
+    void loadCategories()
+  } catch (err) {
+    ElMessage.error(errorText(err))
+  }
+}
+
+/** 清空回收站。删掉的条数由服务端返回，不拿列表当前页的数字凑 —— 那一页可能被搜索过滤过。 */
+async function clearTrash() {
+  try {
+    await ElMessageBox.confirm(
+      '回收站里的所有文件都会被永久删除，原文件与已经建立的索引一并消失，无法恢复。',
+      '清空回收站',
+      {
+        type: 'warning',
+        confirmButtonText: '清空回收站',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger',
+      },
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    const result = await emptyTrash()
+    ElMessage.success(result.message)
+    void load()
+    void loadCategories()
+  } catch (err) {
+    ElMessage.error(errorText(err))
+  }
+}
+
 /** 当前选中的分类标识，作为上传时的默认归属。 */
 const selectedCategoryId = computed(() =>
   selection.value.mode === 'category' ? selection.value.id : null,
@@ -258,7 +381,14 @@ const selectedCategoryId = computed(() =>
               </template>
             </el-input>
             <div class="toolbar-right">
-              <el-button :disabled="phase === 'loading'" @click="load">刷新</el-button>
+              <!-- 只在回收站里出现：清空是一个把整个页面删空的动作，
+                   让它常驻在文件列表旁边，离误点太近 -->
+              <el-button v-if="tab === 'trash'" type="danger" plain @click="clearTrash">
+                清空回收站
+              </el-button>
+              <!-- 必须写成 load()：直接写 load 会把点击事件当成第一个参数传进 silent，
+                   于是loading 态不出现，失败时还会被 `if (silent) return` 吞掉 -->
+              <el-button :disabled="phase === 'loading'" @click="load()">刷新</el-button>
               <!-- 上传限制拿不到就先不给点：对话框里的体积与格式校验都以它为准，
                    放进去也只会得到一个「正在获取…，请稍候重试」的空壳 -->
               <el-tooltip :content="configError ? `拿不到上传限制：${configError}` : '正在获取服务端上传限制'"
@@ -272,9 +402,10 @@ const selectedCategoryId = computed(() =>
           </div>
         </template>
 
-        <el-tabs v-model="archivedTab" class="tabs">
+        <el-tabs v-model="tab" class="tabs">
           <el-tab-pane label="使用中" name="active" />
           <el-tab-pane label="已归档" name="archived" />
+          <el-tab-pane label="回收站" name="trash" />
         </el-tabs>
 
         <!-- 加载中 -->
@@ -283,12 +414,12 @@ const selectedCategoryId = computed(() =>
         <!-- 请求失败 -->
         <el-alert v-else-if="phase === 'error'" type="error" :closable="false" show-icon title="无法加载文件列表">
           <p class="error-detail">{{ loadError }}</p>
-          <el-button text type="primary" @click="load">重试</el-button>
+          <el-button text type="primary" @click="load()">重试</el-button>
         </el-alert>
 
         <!-- 空结果 -->
         <el-empty v-else-if="!items.length" :description="emptyText">
-          <el-button v-if="hasFilter" @click="search = ''; archivedTab = 'active'; categoryKey = 'all'">
+          <el-button v-if="hasFilter" @click="search = ''; tab = 'active'; categoryKey = 'all'">
             清除筛选
           </el-button>
         </el-empty>
@@ -335,13 +466,23 @@ const selectedCategoryId = computed(() =>
               <template #default="{ row }">{{ formatDateTime(row.createdAt) }}</template>
             </el-table-column>
 
-            <el-table-column label="操作" width="170" align="right">
+            <el-table-column label="操作" width="220" align="right">
               <template #default="{ row }">
                 <!-- 阻止冒泡，否则点按钮会同时打开详情抽屉 -->
                 <el-button text type="primary" size="small" @click.stop="download(row)">下载</el-button>
-                <el-button text size="small" @click.stop="toggleArchive(row)">
-                  {{ row.archived ? '恢复' : '归档' }}
-                </el-button>
+                <!-- 回收站里的行只给「恢复」和「彻底删除」两个动作：
+                     归档/取消归档对一份已经删掉的文件没有意义，
+                     而把它放回去之后再改归属，路径也更短 -->
+                <template v-if="tab === 'trash'">
+                  <el-button text size="small" @click.stop="putBack(row)">恢复</el-button>
+                  <el-button text type="danger" size="small" @click.stop="purge(row)">彻底删除</el-button>
+                </template>
+                <template v-else>
+                  <el-button text size="small" @click.stop="toggleArchive(row)">
+                    {{ row.archived ? '恢复' : '归档' }}
+                  </el-button>
+                  <el-button text type="danger" size="small" @click.stop="moveToTrash(row)">删除</el-button>
+                </template>
               </template>
             </el-table-column>
           </el-table>

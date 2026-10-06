@@ -158,12 +158,8 @@ async function confirmDelete(node: TreeNode) {
   }
 }
 
-function onCommand(command: string, node: TreeNode) {
-  if (command === 'create') void promptCreate(node.categoryId, node.label)
-  else if (command === 'rename') void promptRename(node)
-  else if (command === 'delete') void confirmDelete(node)
-}
 </script>
+
 
 <template>
   <el-card shadow="never" class="category-panel">
@@ -189,16 +185,37 @@ function onCommand(command: string, node: TreeNode) {
         <div class="node" :data-name="data.label">
           <span class="node-label" :title="data.label">{{ data.label }}</span>
           <span v-if="data.count !== null" class="node-count">{{ data.count }}</span>
-          <el-dropdown v-if="data.mode === 'category'" trigger="click" @command="(cmd: string) => onCommand(cmd, data)">
-            <span class="node-more" title="更多操作" @click.stop>···</span>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="create">新建子分类</el-dropdown-item>
-                <el-dropdown-item command="rename">重命名</el-dropdown-item>
-                <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+          <!-- 三个动作一律常显，不做成悬停才出现的「···」菜单。
+               删除入口藏在悬停后面时，用户找不到它，只会得出「这个功能没有」的结论 ——
+               一个没人能发现的删除按钮，与不提供删除按钮是等价的。
+               常显的代价是树上多几个符号，比功能看不见便宜得多。
+               图标按钮没有可读文字，aria-label 既是屏幕阅读器的名字，
+               也是端到端测试定位它们的锚点。 -->
+          <span v-if="data.mode === 'category'" class="node-actions">
+            <el-tooltip content="新建子分类" placement="top" :show-after="400">
+              <button class="node-action" type="button" aria-label="新建子分类"
+                @click.stop="promptCreate(data.categoryId, data.label)">
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M8 3.2v9.6M3.2 8h9.6" />
+                </svg>
+              </button>
+            </el-tooltip>
+            <el-tooltip content="重命名" placement="top" :show-after="400">
+              <button class="node-action" type="button" aria-label="重命名" @click.stop="promptRename(data)">
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M11.4 2.3l2.3 2.3-8.6 8.6-3 .7.7-3z" />
+                </svg>
+              </button>
+            </el-tooltip>
+            <el-tooltip content="删除分类" placement="top" :show-after="400">
+              <button class="node-action node-action-danger" type="button" aria-label="删除分类"
+                @click.stop="confirmDelete(data)">
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M2.6 4.3h10.8M6.3 4.3V2.7h3.4v1.6M4.2 4.3l.6 8.8a.9.9 0 0 0 .9.8h4.6a.9.9 0 0 0 .9-.8l.6-8.8" />
+                </svg>
+              </button>
+            </el-tooltip>
+          </span>
         </div>
       </template>
     </el-tree>
@@ -237,18 +254,54 @@ function onCommand(command: string, node: TreeNode) {
   color: var(--el-text-color-secondary);
 }
 
-/* 平时不显示，悬停时才出现，避免树上到处是符号 */
-.node-more {
+.node-actions {
   flex: none;
-  padding: 0 4px;
-  color: var(--el-text-color-secondary);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s;
+  display: flex;
+  align-items: center;
+  /* 按钮本身有 18px 的点击区，再留空隙会把这一行撑得比树还宽 */
+  gap: 0;
 }
 
-.node:hover .node-more {
-  opacity: 1;
+.node-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  /* 常显但不抢眼：树的主体是分类名，操作是次要的 */
+  color: var(--el-text-color-placeholder);
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.node-action svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.node-action:hover {
+  background: var(--el-fill-color);
+  color: var(--el-color-primary);
+}
+
+.node-action-danger:hover {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+/* 键盘用户同样要能看到当前落在哪个按钮上，不能只有 :hover */
+.node-action:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 1px;
 }
 
 .error-detail {

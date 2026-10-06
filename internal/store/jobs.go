@@ -86,6 +86,25 @@ RETURNING c.id, c.document_id, c.attempts, c.max_attempts`
 // 这份文档就会永远停在「索引完成但只搜得到一半内容」的状态，且不会被重试。
 func (s *Store) CompleteIndexJob(ctx context.Context, job *ClaimedJob, chunks []ChunkInput) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 先更新文档状态，并借这次更新确认文档还在。
+		//
+		// 文件可能在索引进行到一半时被「彻底删除」（回收站里清掉）：documents 行没了，
+		// document_chunks 与 index_jobs 也随外键一起消失。这时后面的写入会撞外键，
+		// 整个事务失败、任务被记成一次失败并重试 —— 而重试永远不可能成功，
+		// 白白烧掉三次机会，日志里留下一串看不出原因的报错。
+		//
+		// 放在最前面是因为它同时解决了顺序问题：没有可写的对象就直接结束，
+		// 此时还没有任何片段被删改，事务提交一个空变更即可。
+		res := tx.Exec(`
+UPDATE documents SET index_status = 'ready', index_error = NULL, updated_at = now()
+WHERE id = ?`, job.DocumentID)
+		if res.Error != nil {
+			return fmt.Errorf("更新文档索引状态失败: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+
 		// 先清后写：重试时上一次可能已经写进去一部分片段，
 		// 不清的话 (document_id, ordinal) 唯一约束会直接把这一次也顶掉。
 		if err := tx.Exec(`DELETE FROM document_chunks WHERE document_id = ?`, job.DocumentID).Error; err != nil {
@@ -93,11 +112,6 @@ func (s *Store) CompleteIndexJob(ctx context.Context, job *ClaimedJob, chunks []
 		}
 		if err := insertChunks(tx, job.DocumentID, chunks); err != nil {
 			return err
-		}
-		if err := tx.Exec(`
-UPDATE documents SET index_status = 'ready', index_error = NULL, updated_at = now()
-WHERE id = ?`, job.DocumentID).Error; err != nil {
-			return fmt.Errorf("更新文档索引状态失败: %w", err)
 		}
 		return tx.Exec(`
 UPDATE index_jobs SET status = 'done', last_error = NULL, updated_at = now()

@@ -56,29 +56,24 @@ async function answerConfirm(page: Page, button: string) {
   await box.getByRole('button', { name: button }).click()
 }
 
-/** 打开某个分类节点的「···」菜单。 */
-async function openMenu(page: Page, name: string) {
-  await catRow(page, name).hover()
-  await catRow(page, name).locator('.node-more').click()
-}
-
 /**
- * 在下拉菜单里选一项。下拉 teleport 到 body，得从 page 上找。
+ * 分类行上的动作按钮。
  *
- * 必须限定 :visible：el-dropdown 会把菜单内容一直留在 DOM 里（关闭时只是隐藏），
- * 树上有几个分类就有几份菜单，取 .first() 会点到最靠前那个分类的隐藏菜单上。
+ * 三个按钮是常显的图标，没有可读文字，靠 aria-label 定位 ——
+ * 那个 aria-label 同时也是屏幕阅读器读出来的名字，不是为测试单独加的钩子。
  */
-async function pickMenuItem(page: Page, label: string) {
-  await page.locator('.el-dropdown-menu__item:visible').filter({ hasText: label }).first().click()
+function nodeAction(page: Page, name: string, label: string) {
+  return catRow(page, name).getByRole('button', { name: label })
 }
 
-/** 新建一个分类：点面板标题上的「新建」，或某个节点菜单里的「新建子分类」。 */
+/** 新建一个分类：点面板标题上的「新建」，或某个分类行上的「新建子分类」。 */
 async function createCategory(page: Page, name: string, parent?: string) {
   if (parent) {
-    await openMenu(page, parent)
-    await pickMenuItem(page, '新建子分类')
+    await nodeAction(page, parent, '新建子分类').click()
   } else {
-    await page.locator('.category-panel').getByRole('button', { name: '新建' }).click()
+    // exact 不能省：面板里每一行都有一个「新建子分类」，
+    // 按子串匹配会连它们一起命中，严格模式下直接报错
+    await page.locator('.category-panel').getByRole('button', { name: '新建', exact: true }).click()
   }
   await answerPrompt(page, name, '创建')
 }
@@ -204,8 +199,7 @@ test('刷新后分类结构与文件归属都还在', async ({ page }) => {
 
 test('重命名分类后，树上与列表同时更新', async ({ page }) => {
   await page.goto('/documents')
-  await openMenu(page, '前端')
-  await pickMenuItem(page, '重命名')
+  await nodeAction(page, '前端', '重命名').click()
   await answerPrompt(page, '移动端', '保存')
   await expect(page.getByText('已重命名')).toBeVisible()
 
@@ -216,8 +210,7 @@ test('重命名分类后，树上与列表同时更新', async ({ page }) => {
 
 test('有子分类时不允许删除，并说明原因', async ({ page }) => {
   await page.goto('/documents')
-  await openMenu(page, '研发')
-  await pickMenuItem(page, '删除')
+  await nodeAction(page, '研发', '删除分类').click()
   await answerConfirm(page, '删除分类')
 
   await expect(page.getByText('该分类下还有子分类，请先删除或移走子分类')).toBeVisible()
@@ -228,8 +221,7 @@ test('删除分类：文件不被删除，转为未分类', async ({ page }) => 
   await page.goto('/documents')
 
   // 先删子分类。它下面有 1 个文件，确认框要把这件事说清楚
-  await openMenu(page, '移动端')
-  await pickMenuItem(page, '删除')
+  await nodeAction(page, '移动端', '删除分类').click()
   const box = page.locator('.el-message-box')
   await expect(box).toContainText('1 个文件将变为「未分类」')
   await expect(box).toContainText('文件本身不会被删除')
@@ -239,8 +231,7 @@ test('删除分类：文件不被删除，转为未分类', async ({ page }) => 
   await expect(catRow(page, '移动端')).toHaveCount(0)
 
   // 此时「研发」已没有子分类，可以删除
-  await openMenu(page, '研发')
-  await pickMenuItem(page, '删除')
+  await nodeAction(page, '研发', '删除分类').click()
   await answerConfirm(page, '删除分类')
   await expect(catRow(page, '研发')).toHaveCount(0)
 
@@ -253,8 +244,7 @@ test('删除当前选中的分类后，筛选回到「全部文件」', async ({
   await page.goto('/documents')
   await createCategory(page, '临时分类')
 
-  await openMenu(page, '临时分类')
-  await pickMenuItem(page, '删除')
+  await nodeAction(page, '临时分类', '删除分类').click()
   await answerConfirm(page, '删除分类')
 
   // 停在一个已经不存在的筛选条件上，列表会一直空着且无从解释

@@ -276,9 +276,13 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
             :type="doc.indexStatus === 'failed' ? 'error' : 'warning'" :title="doc.indexError" />
         </el-descriptions-item>
 
+        <!-- 删除与归档是两个独立的位，都会影响「这份文件算不算在用」，
+             所以同时显示而不是二选一：一份归档文件被删掉后，
+             两个标签都要在，恢复时才说得清它会回到哪一边 -->
         <el-descriptions-item label="状态">
-          <el-tag v-if="doc.archived" type="info" size="small">已归档</el-tag>
-          <el-tag v-else type="success" size="small">使用中</el-tag>
+          <el-tag v-if="doc.deletedAt" type="danger" size="small" class="status-tag">已删除</el-tag>
+          <el-tag v-if="doc.archived" type="info" size="small" class="status-tag">已归档</el-tag>
+          <el-tag v-if="!doc.deletedAt && !doc.archived" type="success" size="small">使用中</el-tag>
         </el-descriptions-item>
 
         <el-descriptions-item label="上传时间">{{ formatDateTime(doc.createdAt) }}</el-descriptions-item>
@@ -297,7 +301,10 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
           <el-button type="primary" :disabled="!dirty || busy" @click="save">保存</el-button>
           <el-button :disabled="busy" @click="resetDraft(doc)">取消</el-button>
         </template>
-        <el-button :type="doc.archived ? 'success' : 'warning'" :loading="busy" @click="toggleArchive">
+        <!-- 已经在回收站里的文件不提供归档/取消归档：那会让它看起来还参与日常工作。
+             恢复与彻底删除都在列表的同一行上，抽屉里再放一份是两条要一起维护的入口 -->
+        <el-button v-if="!doc.deletedAt" :type="doc.archived ? 'success' : 'warning'" :loading="busy"
+          @click="toggleArchive">
           {{ doc.archived ? '恢复' : '归档' }}
         </el-button>
       </div>
@@ -316,6 +323,11 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
 
 .doc-empty {
   color: var(--el-text-color-secondary);
+}
+
+/* 「已删除」「已归档」可能同时出现，留一点间距免得看成两个连写的词 */
+.status-tag {
+  margin-right: 6px;
 }
 
 .category-select {

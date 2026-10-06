@@ -18,6 +18,8 @@ export interface DocumentItem {
   categoryName: string | null
   tags: string[]
   archived: boolean
+  /** 非空表示在回收站里。与 archived 是两个独立的位，可以同时成立 */
+  deletedAt: string | null
   storageStatus: string
   indexStatus: IndexStatus
   indexError: string | null
@@ -46,6 +48,8 @@ export interface DocumentListQuery {
   /** 只看没有归属分类的文件，对应分类树上的「未分类」 */
   uncategorized?: boolean
   archived?: boolean
+  /** 只看回收站里的文件。为 true 时 archived 不起作用，两者不叠加 */
+  trashed?: boolean
   page?: number
   pageSize?: number
 }
@@ -64,6 +68,7 @@ export async function listDocuments(query: DocumentListQuery = {}): Promise<Docu
       // 未分类对应 category_id IS NULL，没法用分类标识表达，后端约定为字面量 none
       categoryId: query.uncategorized ? 'none' : (query.categoryId ?? undefined),
       archived: query.archived ? 'true' : undefined,
+      trashed: query.trashed ? 'true' : undefined,
       page: query.page,
       pageSize: query.pageSize,
     },
@@ -119,6 +124,45 @@ export function archiveDocument(id: string): Promise<DocumentItem> {
 
 export function restoreDocument(id: string): Promise<DocumentItem> {
   return updateDocument(id, { archived: false })
+}
+
+/**
+ * 移入回收站（软删除）。
+ *
+ * 原文件与索引都不动，因此恢复之后立刻能被搜到。
+ * 这一步是可撤销的，界面不需要二次确认。
+ */
+export async function deleteDocument(id: string): Promise<DocumentItem> {
+  const { data } = await http.delete<DocumentItem>(`/documents/${encodeURIComponent(id)}`)
+  return data
+}
+
+/** 从回收站恢复。归档状态保持删除前的样子，不会一律回到「使用中」。 */
+export async function restoreFromTrash(id: string): Promise<DocumentItem> {
+  const { data } = await http.post<DocumentItem>(
+    `/documents/${encodeURIComponent(id)}/restore`,
+  )
+  return data
+}
+
+/**
+ * 彻底删除：记录与磁盘上的原文件一起消失，无法恢复。
+ *
+ * 只对回收站里的文件有效；对一份正在使用的文件调用会得到 409。
+ */
+export async function purgeDocument(id: string): Promise<void> {
+  await http.delete(`/documents/${encodeURIComponent(id)}/purge`)
+}
+
+export interface EmptyTrashResult {
+  purged: number
+  message: string
+}
+
+/** 清空回收站。返回真正被删掉的条数，用于告诉用户刚才发生了什么。 */
+export async function emptyTrash(): Promise<EmptyTrashResult> {
+  const { data } = await http.delete<EmptyTrashResult>('/trash')
+  return data
 }
 
 /**

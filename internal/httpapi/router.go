@@ -52,6 +52,14 @@ func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store, embed 
 		api.PATCH("/documents/:id", s.updateDocument)
 		api.POST("/documents/:id/reindex", s.reindexDocument)
 
+		// 删除分两步：DELETE 移入回收站（可撤销），/purge 才是真的抹掉。
+		// 彻底删除只对回收站里的文件生效，所以想毁掉一份正在用的文件必须走两步 ——
+		// 多出来的这一步就是误删可以停下来的地方。
+		api.DELETE("/documents/:id", s.deleteDocument)
+		api.POST("/documents/:id/restore", s.restoreDocument)
+		api.DELETE("/documents/:id/purge", s.purgeDocument)
+		api.DELETE("/trash", s.emptyTrash)
+
 		api.GET("/search", s.searchDocuments)
 		api.POST("/search/semantic", s.searchSemantic)
 
