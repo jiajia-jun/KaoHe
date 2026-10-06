@@ -84,8 +84,15 @@ RETURNING c.id, c.document_id, c.attempts, c.max_attempts`
 //
 // 三件事必须在同一个事务里：如果片段写了一半而任务已标成 done，
 // 这份文档就会永远停在「索引完成但只搜得到一半内容」的状态，且不会被重试。
-func (s *Store) CompleteIndexJob(ctx context.Context, job *ClaimedJob, chunks []ChunkInput) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+// CompleteIndexJob 写入片段并把任务标记为完成。
+//
+// 返回的 written 表示这次是否真的写进去了内容：文档在索引途中被「彻底删除」时
+// 它是 false，而 err 依然是 nil —— 那是正常路径，不是失败。
+// 调用方要靠它区分「索引完成」与「做完了但无处可写」，
+// 否则日志里会出现一条说成功、实际什么都没写的记录。
+func (s *Store) CompleteIndexJob(ctx context.Context, job *ClaimedJob, chunks []ChunkInput) (bool, error) {
+	written := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 先更新文档状态，并借这次更新确认文档还在。
 		//
 		// 文件可能在索引进行到一半时被「彻底删除」（回收站里清掉）：documents 行没了，
@@ -113,10 +120,17 @@ WHERE id = ?`, job.DocumentID)
 		if err := insertChunks(tx, job.DocumentID, chunks); err != nil {
 			return err
 		}
-		return tx.Exec(`
+		if err := tx.Exec(`
 UPDATE index_jobs SET status = 'done', last_error = NULL, updated_at = now()
-WHERE id = ?`, job.JobID).Error
+WHERE id = ?`, job.JobID).Error; err != nil {
+			return err
+		}
+
+		// 放在最后一步之后：事务万一回滚，什么都没写进去，这个标记就不该立起来。
+		written = true
+		return nil
 	})
+	return written, err
 }
 
 func insertChunks(tx *gorm.DB, documentID int64, chunks []ChunkInput) error {

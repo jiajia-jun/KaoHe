@@ -11,11 +11,11 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"path"
 	"sort"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // 注册 "pgx" driver
+	"go.uber.org/zap"
 )
 
 //go:embed sql/*.sql
@@ -34,7 +34,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 //
 // 全程持有一把 advisory lock，因此多个 migrate 容器同时启动也只会有一个真正干活，
 // 其余的等它做完再发现无迁移可做。compose 里 api 依赖它成功退出，所以不用轮询。
-func Run(ctx context.Context, dsn string) error {
+//
+// logger 由调用方注入。migrate 是最不显眼的角色 —— 一次性任务、restart: "no"、
+// 在任何东西启动之前就退出，而 compose 里 api 要等它成功才起 —— 所以它的日志
+// （worker.log / api.log / migrate.log 三个文件里）反而最值得留下来。
+func Run(ctx context.Context, dsn string, logger *zap.Logger) error {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return fmt.Errorf("打开数据库连接失败: %w", err)
@@ -83,14 +87,14 @@ func Run(ctx context.Context, dsn string) error {
 		if err := applyOne(ctx, conn, version); err != nil {
 			return err
 		}
-		slog.Info("迁移已应用", "version", version)
+		logger.Info("迁移已应用", zap.String("version", version))
 		pending++
 	}
 
 	if pending == 0 {
-		slog.Info("数据库结构已是最新，无需迁移", "versions", len(versions))
+		logger.Info("数据库结构已是最新，无需迁移", zap.Int("versions", len(versions)))
 	} else {
-		slog.Info("迁移完成", "applied", pending)
+		logger.Info("迁移完成", zap.Int("applied", pending))
 	}
 	return nil
 }

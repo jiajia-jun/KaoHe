@@ -4,6 +4,8 @@
 target
 data
 uploads
+logs
+logs-clean
 .env
 .env.*
 web/node_modules

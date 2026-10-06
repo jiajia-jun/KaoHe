@@ -3,10 +3,13 @@ package indexer
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"go.uber.org/zap"
+
+	"KaoHe/internal/logging"
 
 	"KaoHe/internal/filekind"
 	"KaoHe/internal/storage"
@@ -28,12 +31,37 @@ type Worker struct {
 	store       *store.Store
 	files       *storage.Store
 	embed       *Embedder
+	log         *zap.Logger
+	slowTask    time.Duration
 	lastRecover time.Time
 }
 
+// Deps 是 Worker 的依赖。
+//
+// 用结构体而不是位置参数：构造函数已经到第五个参数了，再加一个字段时
+// 位置参数只会编译器不报错地错位。NewRouter 同理。
+type Deps struct {
+	Store *store.Store
+	Files *storage.Store
+	Embed *Embedder
+	Log   *zap.Logger
+	// SlowTask 是「多久算慢」的门槛。0 表示不标记。
+	SlowTask time.Duration
+}
+
 // NewWorker 组装一个消费者，但不做任何 IO；连接与探活发生在 Run 里。
-func NewWorker(st *store.Store, files *storage.Store, embed *Embedder) *Worker {
-	return &Worker{store: st, files: files, embed: embed}
+func NewWorker(d Deps) *Worker {
+	if d.Log == nil {
+		// 缺日志器不该让 worker 直接 panic 在第一条日志上。
+		d.Log = zap.NewNop()
+	}
+	return &Worker{
+		store:    d.Store,
+		files:    d.Files,
+		embed:    d.Embed,
+		log:      d.Log,
+		slowTask: d.SlowTask,
+	}
 }
 
 // Run 是 worker 的主循环，直到 ctx 被取消才返回。
@@ -45,7 +73,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 	w.embed.setDimension(dim)
-	slog.Info("worker 已启动", "embedDimension", dim, "poll", pollInterval.String())
+	w.log.Info("worker 已启动",
+		zap.Int("embedDimension", dim),
+		zap.Duration("poll", pollInterval),
+	)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -53,7 +84,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("收到退出信号，worker 停止")
+			w.log.Info("收到退出信号，worker 停止")
 			return nil
 		case <-ticker.C:
 		}
@@ -78,7 +109,7 @@ func (w *Worker) drain(ctx context.Context) error {
 		job, err := w.store.ClaimIndexJob(ctx)
 		if err != nil {
 			// 数据库暂时不可用不该让 worker 退出：下一轮还会再来。
-			slog.Error("领取索引任务失败", "err", err)
+			w.log.Error("领取索引任务失败", zap.Error(err))
 			return nil
 		}
 		if job == nil {
@@ -96,11 +127,11 @@ func (w *Worker) maybeRecoverStale(ctx context.Context) {
 
 	n, err := w.store.RecoverStaleJobs(ctx, staleJobThreshold)
 	if err != nil {
-		slog.Error("恢复中断任务失败", "err", err)
+		w.log.Error("恢复中断任务失败", zap.Error(err))
 		return
 	}
 	if n > 0 {
-		slog.Warn("发现被中断的索引任务，已重新排队", "count", n)
+		w.log.Warn("发现被中断的索引任务，已重新排队", zap.Int64("count", n))
 	}
 }
 
@@ -109,47 +140,98 @@ func (w *Worker) maybeRecoverStale(ctx context.Context) {
 // 它是 worker 的运维参数，不是数据访问的细节。
 const staleJobThreshold = 10 * time.Minute
 
+// indexResult 是 index 的产出，供 process 打一条说实话的完成日志。
+//
+// 「完成」这件事有三种不同的结局，混成一句会让日志无法解释：
+// 真的写了内容、文档在途中被彻底删除所以没写、以及压根没做索引。
+type indexResult struct {
+	// Chunks 是本次切出的片段数。
+	Chunks int
+	// Truncated 表示正文过长，只索引了前 maxChunksPerDocument 片。
+	Truncated bool
+	// Written 为 false 表示文档在抽取与向量都跑完之后被彻底删除，
+	// CompleteIndexJob 的守卫让这次写入变成了空操作。
+	Written bool
+	// Skipped 非空表示这次根本没做索引，值是原因。
+	Skipped string
+}
+
 // process 处理一个任务：读原文件 → 抽正文 → 切片 → 生成向量 → 落库。
 //
 // 任何一步失败都只是这个任务的失败，不会影响别的任务，
 // 更不会影响原文件本身 —— 字节早在上传时就写进持久化目录了。
 func (w *Worker) process(ctx context.Context, job *store.ClaimedJob) {
 	started := time.Now()
-	err := w.index(ctx, job)
+
+	// 一个任务派生一个子 logger：这四个字段描述的是「这个任务是谁」，
+	// 而不是「这一条日志说了什么」，所以在入口绑一次，
+	// 让 index 内部那几条也自动带上，不必各自重抄一遍。
+	log := w.log.With(
+		zap.Int64("jobId", job.JobID),
+		zap.Int64("documentId", job.DocumentID),
+		zap.Int("attempt", job.Attempts),
+	)
+
+	res, err := w.index(ctx, job, log)
+	cost := time.Since(started)
+
 	if err == nil {
-		slog.Info("索引完成", "documentId", job.DocumentID, "attempt", job.Attempts,
-			"cost", time.Since(started).Round(time.Millisecond).String())
+		switch {
+		case res.Skipped != "":
+			// 跳过的原因必须写出来，否则「没有索引完成日志」和「任务丢了」分不清。
+			log.Info("索引跳过", zap.String("reason", res.Skipped), logging.Cost(cost))
+		case !res.Written:
+			// 抽取与向量都跑完了，真正要写库时才发现文档已经不在。
+			// 既不是失败，也不该说成「完成」—— 一个字都没写进去。
+			log.Info("文档已被彻底删除，索引未写入",
+				zap.Int("chunks", res.Chunks), logging.Cost(cost))
+		default:
+			fields := []zap.Field{
+				zap.Int("chunks", res.Chunks),
+				zap.Bool("truncated", res.Truncated),
+				logging.Cost(cost),
+			}
+			// 消息文本与 Info 那次一样，只降级到 Warn 并加 slow 标记 ——
+			// 换个说法的代价是「grep 索引完成」再也捞不全这些行。
+			if w.slowTask > 0 && cost >= w.slowTask {
+				log.Warn("索引完成", append(fields, zap.Bool("slow", true))...)
+				return
+			}
+			log.Info("索引完成", fields...)
+		}
 		return
 	}
 
 	// ctx 被取消（容器收到 SIGTERM）不是任务本身的问题，
 	// 此时不要去改数据库状态：让任务留在 running，由下次启动时的恢复逻辑放回队列。
 	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-		slog.Warn("索引被中断，任务保持 running 等待恢复", "documentId", job.DocumentID)
+		log.Warn("索引被中断，任务保持 running 等待恢复")
 		return
 	}
 
 	retrying, ferr := w.store.FailIndexJob(ctx, job, err.Error())
 	if ferr != nil {
-		slog.Error("记录索引失败时又出错了", "documentId", job.DocumentID, "err", ferr)
+		log.Error("记录索引失败时又出错了", zap.Error(ferr))
 		return
 	}
 	if retrying {
-		slog.Warn("索引失败，稍后重试", "documentId", job.DocumentID,
-			"attempt", job.Attempts, "max", job.MaxAttempts, "err", err)
+		log.Warn("索引失败，稍后重试",
+			zap.Int("max", job.MaxAttempts), zap.Error(err))
 	} else {
-		slog.Error("索引失败，重试次数已用尽", "documentId", job.DocumentID, "err", err)
+		log.Error("索引失败，重试次数已用尽", zap.Error(err))
 	}
 }
 
-func (w *Worker) index(ctx context.Context, job *store.ClaimedJob) error {
+// index 做一次完整的索引。log 由 process 传入，已经带好了 jobId / documentId / attempt，
+// 这样这一层里的几条日志不必自己再拼一遍这三个字段。
+func (w *Worker) index(ctx context.Context, job *store.ClaimedJob, log *zap.Logger) (indexResult, error) {
 	doc, err := w.store.GetDocumentByID(ctx, job.DocumentID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// 文档在排队期间被删除，是正常情况，不值得重试
-			return nil
+			return indexResult{Skipped: "文档在排队期间已被删除"}, nil
 		}
-		return err
+		return indexResult{}, err
 	}
 
 	// 格式按存储键判断，不按用户可见的文件名：
@@ -158,31 +240,31 @@ func (w *Worker) index(ctx context.Context, job *store.ClaimedJob) error {
 	if !filekind.IsExtractable(ext) {
 		// 不可抽取正文的格式（PDF）本就不该有任务。真出现了就把它标记清楚并结束，
 		// 而不是反复重试一个永远不会成功的事。
-		slog.Warn("该格式不支持正文索引，跳过", "documentId", doc.ID, "ext", ext)
-		return nil
+		log.Warn("该格式不支持正文索引，跳过", zap.String("ext", ext))
+		return indexResult{Skipped: "格式 " + ext + " 不支持正文索引"}, nil
 	}
 
 	file, _, err := w.files.Open(doc.StorageKey)
 	if err != nil {
-		return err
+		return indexResult{}, err
 	}
 	defer file.Close()
 
 	text, err := ExtractText(file)
 	if err != nil {
-		return err
+		return indexResult{}, err
 	}
 	chunks, truncated := Chunk(text)
 	if len(chunks) == 0 {
-		return errors.New("文件中没有可索引的正文")
+		return indexResult{}, errors.New("文件中没有可索引的正文")
 	}
 
 	vectors, err := w.embed.EmbedAll(ctx, chunks)
 	if err != nil {
-		return err
+		return indexResult{}, err
 	}
 	if len(vectors) != len(chunks) {
-		return errors.New("向量条数与片段数不一致")
+		return indexResult{}, errors.New("向量条数与片段数不一致")
 	}
 
 	inputs := make([]store.ChunkInput, len(chunks))
@@ -194,18 +276,23 @@ func (w *Worker) index(ctx context.Context, job *store.ClaimedJob) error {
 			Embedding: vectors[i],
 		}
 	}
-	if err := w.store.CompleteIndexJob(ctx, job, inputs); err != nil {
-		return err
+
+	written, err := w.store.CompleteIndexJob(ctx, job, inputs)
+	if err != nil {
+		return indexResult{}, err
 	}
 
-	if truncated {
+	res := indexResult{Chunks: len(chunks), Truncated: truncated, Written: written}
+
+	// 文档已经没了就别再往它身上写提示，那一次更新同样会落在空处。
+	if truncated && written {
 		// 索引成功但不完整。状态保持 ready，把这件事写进 index_error 让界面能提示，
 		// 而不是让用户以为整份文件都搜得到。
 		note := "正文过长，只索引了前 " + strconv.Itoa(maxChunksPerDocument) + " 个片段"
 		if err := w.store.MarkIndexPartial(ctx, doc.ID, note); err != nil {
-			slog.Warn("写入索引截断提示失败", "documentId", doc.ID, "err", err)
+			log.Warn("写入索引截断提示失败", zap.Error(err))
 		}
-		slog.Warn("正文过长，索引被截断", "documentId", doc.ID, "chunks", len(chunks))
+		log.Warn("正文过长，索引被截断", zap.Int("chunks", len(chunks)))
 	}
-	return nil
+	return res, nil
 }

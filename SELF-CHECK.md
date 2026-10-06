@@ -21,7 +21,7 @@
 | 4 | 关键词搜索 | ✅ | 接口 §24；浏览器 03-search 5 条 |
 | 5 | 语义检索 | ✅ | 接口 §25；5 组示例 5/5；向量生成→存储→检索全链路见 §4.5 |
 | 6 | 归档恢复 | ✅ | 接口 §9（列表）+ §27（检索）；浏览器 01-documents |
-| 7 | 数据持久化 | ✅ | `scripts/persistence_check.py`，容器重建前后 PASS=18 FAIL=0 |
+| 7 | 数据持久化 | ✅ | `scripts/persistence_check.py`，容器重建前后 PASS=15 FAIL=0 |
 | 8 | 异常处理 | ✅ | 接口 §12/§20/§21/§22/§26；浏览器 01-documents 的失败与重试用例 |
 | 9 | 操作体验 | ⚠️ 部分 | 流程连贯性与空/错/加载态有用例覆盖；**多种屏幕尺寸没有自动化用例**，见 §6 |
 | 10 | 删除与回收站 | ✅ | 超出验收条件的改进；接口 §28（36 条断言）、浏览器 01-documents 的撤销与彻底删除 2 条 |
@@ -31,13 +31,13 @@
 | 层 | 命令 | 结果 |
 | --- | --- | --- |
 | 静态检查 | `gofmt -l .` / `go vet ./...` / `golangci-lint run ./...` | 干净 / 干净 / 0 issues |
-| Go 单元测试 | `go test ./internal/...` | 25 条全绿（filekind 5、indexer 14、snippet 6） |
+| Go 单元测试 | `go test ./internal/...` | 51 条全绿（logging 11、httpapi 8、config 7、filekind 5、indexer 14、snippet 6） |
 | Go 竞态检测 | `go test -race ./...` | 全绿（在 Linux 容器里跑，见 §3.2） |
 | 接口层验收 | `python scripts/acceptance_api.py` | **PASS=274 FAIL=0**，28 节 |
 | 浏览器端到端 | `cd web && npx playwright test` | **29 passed** |
 | 语义检索示例 | `python scripts/semantic_examples.py --reset` | **5 例中 5 例**首位命中与预期一致 |
 | 从零启动的冒烟 | `python scripts/clean_start_smoke.py` | **PASS=25 FAIL=0**（空库上从头跑迁移） |
-| 持久化演练 | `python scripts/persistence_check.py verify` | **PASS=18 FAIL=0** |
+| 持久化演练 | `python scripts/persistence_check.py verify` | **PASS=15 FAIL=0**（条数随库里文档数变化，每份文件一项） |
 
 ---
 
@@ -87,13 +87,17 @@ docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=1 golang:1.27-alpine \
   sh -c 'apk add --no-cache gcc musl-dev && go test -race ./...'
 ```
 
-覆盖的是三块**纯函数 + 一处并发**，都是逻辑密度高、出错了却不会报错只会算错的地方：
+覆盖的是几块**纯函数、一处并发、加上日志与配置的装配**，
+都是逻辑密度高、出错了却不会报错只会算错的地方：
 
 | 包 | 测什么 |
 | --- | --- |
 | `internal/snippet` | 命中片段的取窗：按字符不按字节、大小写折叠、省略号只在真截断时加 |
 | `internal/indexer` | 切片不丢字不超上限、行边界优先、重叠尾巴；向量边车客户端的维度与错误处理 |
 | `internal/filekind` | 格式清单大小写不敏感，以及「收不收」与「抽不抽正文」两处判断用的是同一份数据 |
+| `internal/logging` | 等级解析与非法值拒绝、落盘是真 JSON、角色各写一个文件、清理可重复调用、目录不可写时失败 |
+| `internal/config` | 两种 DSN 形式的口令都不出现在 `RedactedDSN` 的输出里；日志与慢阈值变量的默认值和非法值 |
+| `internal/httpapi` | requestId 的消毒与回显、访问日志的分级与 `slow` 标记、检索词不进日志、panic 后仍有访问日志 |
 
 `internal/indexer/embed_test.go` 里的 `TestEmbedderIsSafeForConcurrentUse` 值得单独说一句：
 它**不带 `-race` 跑也会通过**，因为它盯的是数据竞争，而竞争平时看不出症状。
@@ -153,15 +157,16 @@ python scripts/semantic_examples.py --reset --json docs/semantic-examples.json
 也不用冒着删卷的风险去验：
 
 ```bash
-WEB_PORT=8091 docker compose -p kaoheclean up -d --build
+# LOG_HOST_DIR 必须换一个：日志文件名按角色固定，两套栈写同一个 api.log 会让轮转互相踩
+LOG_HOST_DIR=./logs-clean WEB_PORT=8091 docker compose -p kaoheclean up -d --build
 
 # 对着 8091 跑一次冒烟：健康接口 → 校验迁移与迁移文件一一对应 → 确认起点是空库 →
 # 上传 10 份语料 → 等索引 → 关键词检索 → 语义检索 → 下载逐字节比对 → 建分类 / 移动 / 归档
 python scripts/clean_start_smoke.py
 
 # 验完拆掉，注意只删这个项目的卷
-docker compose -p kaoheclean down
-docker volume rm kaoheclean_pgdata kaoheclean_uploads
+LOG_HOST_DIR=./logs-clean docker compose -p kaoheclean down
+docker volume rm kaoheclean_pgdata kaoheclean_uploads && rm -rf logs-clean
 ```
 
 `--project`（compose 项目名）与 `--base`（接口地址）是配对的，默认值就是上面这一对。
@@ -196,6 +201,54 @@ python scripts/persistence_check.py verify
 分类树、归档集合、关键词检索结果（含顺序）、语义检索首位与相似度，
 并检查挂载的具名卷确实是同一份。挂到新卷上等于数据从零开始，
 那种「没报错但东西没了」是最难查的一种。
+
+### 3.8 日志系统
+
+日志不是验收条件里的条目，是本次另外加的一项能力，所以它的验证单独记在这里 ——
+几项行为都只能靠改配置、造真实流量才看得出来，光看代码不算数。
+
+**分级**（`LOG_LEVEL=error`）：三个返回 200 的请求留下 **0 行**访问日志；
+停掉 `db` 制造的真实 500 仍然被记下来，而是两条 —— 一条 `failInternal` 带错误原因，
+一条访问日志带 status 与耗时，两条的 `requestId` 相同：
+
+```jsonc
+{"level":"error","msg":"请求处理失败","requestId":"cf2d41250d045bec","path":"/api/v1/documents",
+ "error":"查询文档列表失败: failed to connect to …"}
+{"level":"error","msg":"请求","requestId":"cf2d41250d045bec","status":500,"costMs":7993.27,"slow":true}
+```
+
+500 出两条是**有意为之**：一条说原因，一条说结果。把 `requestId` 对上就还原了整次请求。
+
+**慢标记**（`SLOW_REQUEST_MS=1` / `SLOW_TASK_MS=1`）：同一批请求里
+耗时 1.19ms 的那条升到 `warn` 并带 `slow=true`，0.29ms 的仍是 `info`；
+worker 侧 `索引完成` 升到 `warn` 并带 `slow=true`，**消息文本一个字没改**，
+`grep 索引完成` 照样能捞到全部。
+
+**脱敏**。口令（21 字符）在三个日志文件里 0 命中。更有意义的是第二条：
+上传一份正文里嵌了唯一哨兵串 `ZQXSENTINEL7F3A9B2C` 的 Markdown，
+等它索引完成后 —— 库里 `document_chunks` 有 **12 个片段**含这个串（对照组成立），
+而三个日志文件与全部 stdout 里 **0 命中**。这条才是能抓住 `ParameterizedQueries`
+回归的检查：GORM 默认打印参数已插值的 SQL，正文会整批进日志。
+
+**轮转**（`LOG_MAX_SIZE_MB=1`）：打满 1 MiB 后切出一份 1,048,342 字节的历史文件、
+并新建 `api.log` 继续写。切出来的名字是 `api-2026-10-06T07-11-28.268.log`
+（lumberjack 的带时间戳约定，不是 `api.log.1`）。
+
+**退出**：`docker compose stop api` 后 stderr **没有** `invalid argument`。
+这一条单独看没有说服力 —— 所以同时确认了进程真的走到了收尾路径：
+`收到退出信号，正在关闭 api` 这行确实落进了文件，说明 `Sync` + 关闭跑过了、没有报错。
+
+**panic 路径**没有硬去现场制造（`documents.go` 那个 panic 要 `crypto/rand` 失败才触发），
+改用中间件单测断言：返回体是 `{"code":"internal_error",…}` 的 JSON、
+恰好一条带 `stack` 的 Error 日志、且**恰好一条** status=500 的访问日志。
+这条用例做过反向验证：把中间件顺序换回 `gin.Recovery(), AccessLog()`，它会红。
+
+**容器重建后日志延续**：`docker compose down` + `up -d` 之后三个文件都还在并继续追加
+（561→595 / 4→6 / 31→34 行），没有截断也没有 NUL 字节。
+
+> 一个踩过的坑记在这里：容器还在跑的时候从宿主机 `> logs/api.log` 截断文件，
+> 会让它继续按旧偏移追加，中间留下一段 26 万字节的 NUL 填充。
+> 清日志要先停容器，或者干脆交给轮转。
 
 ---
 
@@ -300,9 +353,13 @@ PDF 的下载另外验了 Range 请求（§8），因为在线预览依赖它。
 「部署配置应正确挂载持久化存储」是**检查实际挂载**，不是读 compose 文件——
 `persistence_check.py` 用 `docker inspect` 取出容器真正挂的卷名，并确认停机前后是同一份。
 
-**本次记录**：演练前 10 份文件（其中 1 份归档）、2 个分类；
-`docker compose down` → `up -d` 后 api 容器 ID 从 `8384e268…` 变成 `d2bc472d…`（确实重建了），
-比对结果 **PASS=18 FAIL=0**，逐字段含 sha256 全部一致。
+**本次记录**：演练前 7 份文件（其中 0 份归档）、2 个分类；
+`docker compose down` 把五个容器全部删除、`up -d` 重新创建之后，
+比对结果 **PASS=15 FAIL=0**，逐字段含 sha256 全部一致。
+断言条数随库里文档数变化（每份文件一项），所以这里记的是**这一次**的数字。
+
+同一次重建顺带验了日志：三个文件都还在并继续追加（561→595 / 4→6 / 31→34 行），
+没有截断、没有 NUL 字节 —— 绑定挂载和具名卷一样扛得住容器重建。
 
 ### 4.8 异常处理
 
@@ -389,11 +446,23 @@ PDF 的下载另外验了 Range 请求（§8），因为在线预览依赖它。
    它没法写进默认套件：这个时序要求恰好在上传完成、worker 正在抽取正文时按下彻底删除，
    换一台机器（或换一次编译）就会变成随机红灯。
    本次用一个 440 KB 的 Markdown 手工验过 —— 轮询到 `processing` 后立刻软删除再彻底删除，
-   worker 那一轮的日志是 `索引完成 documentId=21 attempt=1 cost=15.41s`：
+   worker 那一轮留下的 `索引完成` 那条日志带着 `documentId=21`、`attempt=1`，耗时 15.41s：
    整条抽取与向量链路跑完、真正要写库时才发现文档已经不在了，于是提交一个空事务干净退出。
    事后查库：该文档的 `documents` 行、`document_chunks`、`index_jobs` 残留都是 0，
    全库也没有孤儿片段、孤儿任务或失败任务。
+
+   > 上面那次运行发生在引入 zap 之前，所以当时的日志是 `documentId=21 attempt=1 cost=15.41s`
+   > 这样一行纯文本。现在同一条日志是 JSON，会多出 `jobId`、`chunks`、`truncated` 三个字段，
+   > 耗时也从 `cost=15.41s` 变成 `costMs=15410.12` 这样的浮点毫秒 ——
+   > 单位写进键名，是因为纯数字自己说不清量级；用浮点是因为这个系统的请求经常在 1 毫秒以下，
+   > 整数毫秒会把它们全部压成 0。**消息措辞一个字没改**，`grep 索引完成` 仍然捞得到全部。
+
    保证它成立的是 `internal/store/jobs.go` 里 `CompleteIndexJob` 的守卫 ——
    **先更新 `documents`，受影响行数为 0 就直接返回**。没有这个顺序，
    这次写入会撞上外键、被记成一次失败并重试三次，而重试永远不可能成功。
    这条守卫因此不只是优化，删掉它这个场景就会退化成噪声。
+
+   代价要说清楚：**这条守卫没有自动化用例**。`internal/store` 目前一个测试文件都没有
+   （有单测的只有 `filekind` / `indexer` / `snippet` / `logging` / `config` / `httpapi`），
+   要测它得先给 store 层引入测试数据库基建（sqlite 驱动或 testcontainer），
+   那是独立的一次决定，不在本次范围内。这里给出的证据是代码本身加事后查库的结果。

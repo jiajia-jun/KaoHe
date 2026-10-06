@@ -47,6 +47,7 @@ docker compose down
 
 > ⚠️ **不要使用 `docker compose down -v`。**
 > `-v` 会连同具名卷一起删除，文件、分类与归档状态将全部丢失，且无法通过重建镜像恢复。
+> 正常情况下 `-v` 也不必要：`./logs` 是绑定挂载、不在卷里，但 `uploads` 与 `pgdata` 会一起没。
 
 ---
 
@@ -88,12 +89,71 @@ docker compose down
 | `WEB_PORT` | `8080` | 宿主机访问端口，唯一对外暴露的端口 |
 | `MAX_UPLOAD_BYTES` | `20971520` | 单文件上传上限（20 MiB），超限返回 413 |
 | `SEMANTIC_MIN_SCORE` | `0.5` | 语义检索的余弦相似度下限，低于它的片段不展示 |
+| `LOG_LEVEL` | `info` | 日志等级：`debug` / `info` / `warn` / `error` |
+| `LOG_CONSOLE_FORMAT` | `console` | **只影响 stdout** 的格式，文件恒为 JSON |
+| `LOG_HOST_DIR` | `./logs` | 日志落在宿主机哪个目录（容器内固定为 `/data/logs`） |
+| `LOG_MAX_SIZE_MB` | `32` | 单文件超过它就切一份，必须为正 |
+| `LOG_MAX_BACKUPS` | `5` | 最多保留几份轮转文件，`0` 表示不限 |
+| `LOG_MAX_AGE_DAYS` | `30` | 轮转文件最多留几天，`0` 表示不限 |
+| `LOG_COMPRESS` | `false` | 轮转文件是否压成 `.gz`（开了就得用 `zcat` 看） |
+| `SLOW_REQUEST_MS` | `500` | 超过它的请求标 `slow=true`，并升到 `warn` |
+| `SLOW_TASK_MS` | `5000` | 超过它的索引任务标 `slow=true` |
 
 `db`、`api`、`worker`、`embed` 均**不映射宿主机端口**，只在 compose 内网互通，
 因此不存在与本机已有服务抢端口的问题。
 
 `SEMANTIC_MIN_SCORE` 的值是按当前向量模型在验收语料上标定出来的，
 换模型后必须重新标定 —— 标定方法与实测数据见 `docs/DESIGN.md` §4.3。
+
+### 日志
+
+`api` / `worker` / `migrate` 三个角色各写一个文件，绑定挂载到仓库下的 `./logs`：
+
+```text
+logs/api.log       logs/worker.log       logs/migrate.log
+```
+
+按角色分文件是**必须的**，不是偏好：`api` 与 `worker` 是两个独立进程，
+而轮转是「重命名 + 新建」、不做多进程同步，两个进程写同一个文件会交替丢日志、轮转互相踩。
+同理，**同时跑两套栈时必须给其中一套换 `LOG_HOST_DIR`**（见 §八 的空库自测）。
+
+文件是 JSON，每行一条，`service` 字段标明来自哪个角色：
+
+```jsonc
+{"level":"info","ts":"…","caller":"indexer/worker.go:200","msg":"索引完成",
+ "service":"worker","jobId":9,"documentId":10,"attempt":1,
+ "chunks":12,"truncated":false,"costMs":255.52}
+```
+
+跨文件关联靠这几个字段，排查时优先按它们 grep：
+
+| 字段 | 含义 |
+| --- | --- |
+| `requestId` | 一次 HTTP 请求，回写到响应头 `X-Request-Id`，仅 api 侧有 |
+| `documentId` | 文档的数字主键 |
+| `docUID` | 文档对外的 `doc_xxxx` 标识 |
+| `jobId` | 一次索引任务 |
+| `service` | 进程角色（`api` / `worker` / `migrate`） |
+
+索引是异步的，worker 处理任务时那次 HTTP 请求早已结束、而且在另一个容器里，
+所以 **worker 日志里没有 `requestId`** —— 硬塞进去只是撒谎。
+一份文档跨两个文件的连接键是 `documentId`：上传成功后 api 记一条
+`文档已入库`（带 `documentId` 与 `docUID`），worker 处理它时记同一个 `documentId`：
+
+```jsonc
+// api.log   —— 上传时
+{"msg":"文档已入库","documentId":19,"docUID":"doc_40f0db59ee132146","enqueued":true}
+// worker.log —— 索引时
+{"msg":"索引完成","jobId":17,"documentId":19,"attempt":1,"chunks":2,"costMs":76.08}
+```
+
+两个开关值得单独说：
+
+- `SLOW_REQUEST_MS` / `SLOW_TASK_MS` 超出的条目会带 `slow=true`，请求还会升到 `warn`。
+  这样 `LOG_LEVEL=warn` 时留下的正好全是异常，慢请求不会被淹没在正常行里。
+  默认值是实测标定的：本机接口请求绝大多数在 45ms 以内，索引任务在 16ms~585ms。
+- `LOG_DIR` 不可写时进程**拒绝启动**。宁可起不来，也不要一个看起来正常、
+  却永远不产生日志文件的进程 —— 「日志悄悄失效」正是这次要消灭的那类问题。
 
 ---
 
@@ -196,6 +256,27 @@ docker compose logs --tail=100 web
 
 **首次构建卡住** —— 多为镜像或 npm 拉取慢，可配置国内镜像源后重试。
 
+**想看某个请求到底发生了什么** —— 响应头里有 `X-Request-Id`，拿它去日志里对：
+
+```bash
+docker compose exec api grep '<requestId>' /data/logs/api.log
+# 或者直接看文件：日志就在仓库下的 ./logs/api.log
+```
+
+浏览器里拿不到这个头时，服务端自己生成的 id 也在每一条访问日志里，
+按 `slow=true` 或 `status=500` 筛一遍就能找到可疑的那次请求。
+
+**想知道某个文件索引得怎么样** —— 用 `documentId` 跨两个文件 grep：
+
+```bash
+docker compose exec api sh -c 'grep "\"documentId\":10" /data/logs/*.log'
+```
+
+**日志文件里出现大片 NUL 或者看不见新内容** —— 多半是在容器还跑着的时候
+从宿主机 `> logs/api.log` 截断了文件：容器仍按旧偏移追加，中间就留下一段空洞。
+清日志要先把容器停掉（`docker compose stop api worker && rm logs/*.log`），
+或者干脆用轮转（`LOG_MAX_SIZE_MB`），别手工截断。
+
 ---
 
 ## 七、目录结构
@@ -211,7 +292,8 @@ docker compose logs --tail=100 web
 │   ├── store/             数据访问：文档、分类、索引任务、检索
 │   ├── indexer/           正文抽取、切片、向量边车客户端、任务消费者
 │   ├── snippet/           命中片段的取窗（按字符，不按字节）
-│   ├── httpapi/           HTTP 路由与处理器
+│   ├── logging/           zap 装配、字段词表、按角色落盘与轮转
+│   ├── httpapi/           HTTP 路由、处理器与请求链路中间件
 │   └── migrate/sql/       迁移文件，按文件名顺序执行
 ├── services/embed/        向量边车（Python + ONNX Runtime）
 │   ├── model/             bge-small-zh-v1.5 的 int8 ONNX 产物
@@ -226,6 +308,7 @@ docker compose logs --tail=100 web
 │   └── Dockerfile         构建前端并打包进 nginx 镜像
 ├── testdata/corpus/       验收用测试文档（10 份）
 ├── docs/                  架构设计、检索示例
+├── logs/                  落盘的日志（绑定挂载，不进仓库）：api / worker / migrate 各一份
 ├── SELF-CHECK.md          测试与验收说明
 ├── .golangci.yml          静态检查配置
 ├── docker-compose.yml
@@ -240,7 +323,7 @@ docker compose logs --tail=100 web
 
 ```bash
 gofmt -l . && go vet ./... && golangci-lint run ./...   # 静态检查
-go test ./internal/...                                  # 单元测试（25 条）
+go test ./internal/...                                  # 单元测试（51 条）
 
 python scripts/acceptance_api.py          # 接口层验收（274 条断言）
 python scripts/semantic_examples.py --reset   # 5 组检索示例
@@ -251,9 +334,11 @@ cd web && npx playwright test             # 浏览器端到端（29 条）
 
 ```bash
 # 空库从零启动：另起一套 compose 项目（端口 8091），不碰现有数据
-WEB_PORT=8091 docker compose -p kaoheclean up -d --build
+# LOG_HOST_DIR 必须换一个：日志文件名按角色固定，两套栈写同一个 api.log 会让轮转互相踩
+LOG_HOST_DIR=./logs-clean WEB_PORT=8091 docker compose -p kaoheclean up -d --build
 python scripts/clean_start_smoke.py
-docker compose -p kaoheclean down && docker volume rm kaoheclean_pgdata kaoheclean_uploads
+LOG_HOST_DIR=./logs-clean docker compose -p kaoheclean down
+docker volume rm kaoheclean_pgdata kaoheclean_uploads && rm -rf logs-clean
 
 # 持久化演练：停机那一步必须由人工执行，所以拆成两段
 python scripts/persistence_check.py snapshot
@@ -280,5 +365,6 @@ python scripts/persistence_check.py verify
 | M6 | 异常态与交互反馈打磨 | ✅ 已完成 |
 | M7 | 交付文档、5 组检索示例与验证脚本 | ✅ 已完成 |
 | M8 | 删除与回收站：文件软删除 / 恢复 / 彻底删除，分类删除入口常显 | ✅ 已完成 |
+| M9 | 日志系统：zap 结构化日志、请求链路、按角色落盘与轮转 | ✅ 已完成 |
 
 每一步都对应一次提交，提交信息里写明了该里程碑的取舍。

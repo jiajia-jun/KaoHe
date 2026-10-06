@@ -218,6 +218,60 @@ ONNX Runtime 是 C++ 生态，Go 侧要链接它得引入 CGO，构建会从「�
 没有这个顺序，那次写入会撞上外键（`document_chunks` 与 `index_jobs` 都随文档级联消失），
 被记成一次失败并重试三次，而重试永远不可能成功。
 
+### 3.9 日志：两个 core、按角色落盘、接上两条被绕过的流
+
+原先用的是标准库 `log/slog` 的默认 logger：TextHandler、等级写死 `Info`、只输出到 stdout。
+在容器里这意味着**日志随容器一起消失**，而且没法按等级过滤。现在换成 zap，
+三个角色各写一个 JSON 文件并轮转。
+
+**为什么是两个 core 而不是一个。** stdout 给人看要用 console 文本，文件给机器读要用 JSON。
+直觉的写法是 `NewMultiWriteSyncer(stdout, file)` 配一个 encoder —— 那是错的：
+encoder 是 **Core** 的属性、不是 WriteSyncer 的属性，多路复用发生在**编码之后**，
+所以那样写会把 console 文本一并写进文件。正确做法是两个 Core 交给 `zapcore.NewTee`。
+
+**为什么按角色分文件。** `api` 与 `worker` 是两个独立容器，而轮转是「重命名 + 新建」、
+不做多进程同步：两个进程各持句柄、各按自己的计数切分，结果是交替丢日志、轮转互相踩。
+跨容器的文件锁本身也不可靠，所以不加锁，而是接受一条**单副本约束**：
+`docker compose up --scale api=3` 会打破这套命名。真要扩容，得改成按 hostname 分文件
+或改用集中式收集。脚本里那套空库自测会同时起两套栈，同理用 `LOG_HOST_DIR` 隔开。
+
+**目录不可写时拒绝启动**，而不是降级成「只写 stdout」。lumberjack 是第一次写才
+`MkdirAll` 的，而 zapcore **会丢掉 Core 的 Write 错误** —— 一个不可写的目录会安静地
+变成「文件日志根本不存在」，进程照跑、看起来一切正常，直到有人去找日志才发现。
+所以装配时提前探一次：`MkdirAll` 加一次试开，失败就让进程起不来。
+
+**换 zap 不会自动收编那两条绕过日志的流，必须显式接。** GORM 的 SQL 日志走 stdlib log
+直接写 stderr，`gin.Recovery()` 的 panic 也是。后者换成
+`gin.CustomRecoveryWithWriter(io.Discard, …)`，让 panic 只经 zap 一条路，
+同时仍回那套 `{"code": …}` 的 JSON 错误契约（前端与验收脚本都依赖它）。
+
+**脱敏的真正内容不是数据库口令。** GORM 默认打印的是**参数已插值**的完整 SQL，
+批量插入时参数里带着 `chunk.Content`，也就是用户上传的正文。修法是把参数留在占位符里：
+`logger.Config{ParameterizedQueries: true}`。这条比「口令别进日志」重要得多 ——
+口令只在 DSN 里出现一次且已被换成 `REDACTED`，而正文会在每一次慢查询或出错时整批进日志。
+验收时用一个正文含唯一哨兵串的文件实测过：库里 12 个片段都含它，日志里 0 命中。
+
+**请求链路**：`X-Request-Id` 由中间件读取或生成，回写到响应头，并把带该字段的子 logger
+放进 gin 上下文。放进上下文而不是每次现拼，是因为 `failInternal` 是个**没有接收者的自由
+函数**、却又是所有 handler 错误路径的汇合点 —— 只有这样才能让它零改动就带上 `requestId`。
+客户端给的 id 必须先消毒（只放行长度受限的 `[A-Za-z0-9._-]`）：夹一个换行就能在日志里
+凭空伪造一整行。
+
+**中间件顺序是顺路修掉的一个 bug。** 原来写的是 `gin.Recovery(), accessLog()`，
+先注册的更靠外，所以 Recovery 包住了 accessLog —— **panic 的那次请求反而没有访问日志**。
+现在是 `RequestID → AccessLog → Recovery`，并且有一个用例钉住它。
+
+**一个诚实的限制**：索引是异步的，worker 处理任务时那次 HTTP 请求早已结束、而且在另一个
+容器里。往 worker 日志里塞 `requestId` 是撒谎。真正存在的关联键是实体（`documentId` /
+`jobId`），运维在一份文档上跨两个文件 grep。要做真端到端追踪，得给 `index_jobs` 加一列
+并改造入队逻辑 —— 为一个没人提的需求做 schema 迁移，不做。
+
+**耗时的单位写进键名。** 字段叫 `costMs` 而不是 `cost`，因为值是纯数字、单位不在里面。
+用浮点而不是整数：这个系统的请求经常在 1 毫秒以下（健康检查实测 0.4~0.7ms），
+`zapcore.MillisDurationEncoder` 做整数除法会把它们**全部压成 0** ——
+这不是假设，是第一版的真实输出：切出 6 行访问日志，6 行全是 `"cost":0`，
+而 console 那边显示的是 `434µs`。这个字段存在的意义就是分辨快慢，压成 0 等于白记。
+
 ---
 
 ## 4. 语义检索的标定与验证
@@ -311,3 +365,10 @@ ONNX Runtime 是 C++ 生态，Go 侧要链接它得引入 CGO，构建会从「�
     见 `scripts/acceptance_api.py` 的文件头说明。
 11. **`docker compose down -v` 会删光数据**，且重建镜像无法恢复。
     文档与 README 都做了显式警告。
+12. **日志文件不支持同一角色的多副本**。文件名按角色固定（`api.log` / `worker.log` /
+    `migrate.log`），轮转不做多进程同步，所以 `--scale api=3` 或同时跑两套栈
+    都会让两个进程写同一个文件。前者要改成按 hostname 分文件或上集中式收集，
+    后者用 `LOG_HOST_DIR` 隔开即可（脚本里的空库自测就是这么做的）。
+13. **索引任务的日志无法关联到发起它的那次 HTTP 请求**。见 §3.9 末段：
+    异步执行 + 跨容器，硬塞 `requestId` 只会得到一条撒谎的日志。
+    跨进程的连接键是 `documentId` / `jobId`。

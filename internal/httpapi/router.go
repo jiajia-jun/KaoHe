@@ -3,11 +3,11 @@ package httpapi
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"KaoHe/internal/config"
 	"KaoHe/internal/indexer"
@@ -24,17 +24,30 @@ type Server struct {
 	// embed 只用于语义检索：把用户的自然语言描述转成查询向量。
 	// 边车不可用时它返回错误，API 本身照常提供文件管理与关键词检索。
 	embed *indexer.Embedder
+	// log 是基础 logger。请求内的日志用 LoggerFrom(c) 取带 requestId 的子 logger，
+	// 这个只在没有请求上下文的地方用（如 health 里的启动期判断）。
+	log *zap.Logger
 }
 
 // NewRouter 装配全部路由。所有接口都挂在 /api/v1 下，
 // 只有 /healthz 例外 —— 容器的 healthcheck 直接打 api，不经过 nginx。
-func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store, embed *indexer.Embedder) *gin.Engine {
+func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store,
+	embed *indexer.Embedder, log *zap.Logger) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
-	s := &Server{cfg: cfg, store: st, storage: files, embed: embed}
+	if log == nil {
+		log = zap.NewNop()
+	}
+	s := &Server{cfg: cfg, store: st, storage: files, embed: embed, log: log}
 
 	r := gin.New()
-	r.Use(gin.Recovery(), accessLog())
+	// 顺序不能改：RequestID 最外、AccessLog 居中、Recovery 贴着 handler。
+	//
+	// 写成 Use(Recovery(), AccessLog()) 的话 Recovery 在外层，
+	// panic 会直接把 AccessLog 的栈帧掀掉 —— 于是出错最严重的那次请求
+	// 恰恰没有访问日志。现在这个顺序里 Recovery 先恢复并把响应写完，
+	// AccessLog 的收尾代码照常执行，能看到那条 500。
+	r.Use(RequestID(log), AccessLog(log, time.Duration(cfg.SlowRequestMS)*time.Millisecond), Recovery(log))
 
 	// 供容器 healthcheck 直接访问，不经过 nginx
 	r.GET("/healthz", s.health)
@@ -72,19 +85,6 @@ func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store, embed 
 	return r
 }
 
-func accessLog() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-		slog.Info("请求",
-			"method", c.Request.Method,
-			"path", c.Request.URL.Path,
-			"status", c.Writer.Status(),
-			"cost", time.Since(start).Round(time.Millisecond).String(),
-		)
-	}
-}
-
 // health 同时用于容器编排的健康判定与前端首页的系统状态展示。
 // 数据库不可达时返回 503，让 compose 不要把一个连不上库的 api 标记为健康。
 func (s *Server) health(c *gin.Context) {
@@ -98,7 +98,8 @@ func (s *Server) health(c *gin.Context) {
 	}
 
 	if err := s.store.Ping(ctx); err != nil {
-		slog.Error("健康检查：数据库不可达", "err", err)
+		// 走请求 logger，这样一条健康检查失败也能顺着 requestId 找到它的访问日志。
+		LoggerFrom(c).Error("健康检查：数据库不可达", zap.Error(err))
 		body["status"] = "degraded"
 		body["db"] = "down"
 		c.JSON(http.StatusServiceUnavailable, body)

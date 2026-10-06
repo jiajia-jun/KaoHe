@@ -2,11 +2,11 @@ package httpapi
 
 import (
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 // 错误码常量。前端据此区分处理方式，不必解析中文文案。
@@ -35,11 +35,14 @@ func fail(c *gin.Context, status int, code, message string) {
 }
 
 func failInternal(c *gin.Context, err error) {
-	// 详细原因（含 SQL、磁盘路径）只进服务端日志，不回传给客户端
-	slog.Error("请求处理失败",
-		"method", c.Request.Method,
-		"path", c.Request.URL.Path,
-		"err", err,
+	// 详细原因（含 SQL、磁盘路径）只进服务端日志，不回传给客户端。
+	// 这里取的是请求级的子 logger，所以这条日志带着 requestId，
+	// 能和同一次请求的访问日志对上 —— 这是它必须走上下文而不能用全局 logger 的原因。
+	logger := LoggerFrom(c)
+	logger.Error("请求处理失败",
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.Request.URL.Path),
+		zap.Error(err),
 	)
 	c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 		"code":    codeInternalError,

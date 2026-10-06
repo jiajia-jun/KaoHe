@@ -35,6 +35,12 @@ docs/semantic-examples.json
 /data/
 /uploads/
 
+# 落盘的日志。/logs 是绑定挂载到仓库下的目录，内容含请求路径与文件名，
+# 属于「这台机器上跑过什么」，不该进仓库。
+/logs/
+# 第二套栈（clean_start_smoke 用的 LOG_HOST_DIR）会落在这里
+/logs-clean/
+
 # 编辑器与系统
 .vscode/
 .idea/

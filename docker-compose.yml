@@ -9,8 +9,34 @@
 #   * embed 单独一个镜像：它要 Python 与 ONNX Runtime，和静态 Go 二进制的基础镜像不同。
 #   * migrate 是一次性任务，api 与 worker 通过 service_completed_successfully 等它成功后才启动。
 #   * 数据全部落在具名卷 pgdata / uploads 上，容器重建不影响数据。
+#   * 日志绑定挂载到仓库下的 ./logs，三个角色各写一个文件（api.log / worker.log /
+#     migrate.log）。绑定挂载而不是具名卷，是为了能直接在文件管理器里打开看。
 
 name: kaohe
+
+# 日志配置由三个角色共用，用锚点写一份、各处 <<: *log-env 引入。
+#
+# LOG_DIR 在这里显式设成 /data/logs：程序自己的默认值是「不落盘、只写 stdout」，
+# 那样本机 go run / go test 不会在盘符根目录下凭空建出 /data/logs。
+# 容器里要落盘，所以由 compose 明确打开。日志目录不可写时进程会拒绝启动 ——
+# 宁可起不来，也不要一个看起来正常却永远不产生日志文件的进程。
+#
+# 宿主机一侧的目录用 LOG_HOST_DIR 覆盖（默认 ./logs）：文件名按角色固定，
+# 因此**同时跑两套栈时两边必须指向不同的目录**，否则两个进程写同一个 api.log，
+# 轮转（重命名 + 新建）会让它们各写各的、谁也轮转不动谁。
+# scripts/clean_start_smoke.py 起第二套栈时就走这条路：
+#     LOG_HOST_DIR=./logs-clean WEB_PORT=8091 docker compose -p kaoheclean up -d --build
+x-logging-env: &log-env
+  LOG_LEVEL: "${LOG_LEVEL:-info}"
+  # 只影响 stdout 的格式，文件恒为 JSON，所以名字里写明了是 console 的格式。
+  LOG_CONSOLE_FORMAT: "${LOG_CONSOLE_FORMAT:-console}"
+  LOG_DIR: /data/logs
+  LOG_MAX_SIZE_MB: "${LOG_MAX_SIZE_MB:-32}"
+  LOG_MAX_BACKUPS: "${LOG_MAX_BACKUPS:-5}"
+  LOG_MAX_AGE_DAYS: "${LOG_MAX_AGE_DAYS:-30}"
+  LOG_COMPRESS: "${LOG_COMPRESS:-false}"
+  SLOW_REQUEST_MS: "${SLOW_REQUEST_MS:-500}"
+  SLOW_TASK_MS: "${SLOW_TASK_MS:-5000}"
 
 services:
   db:
@@ -39,6 +65,12 @@ services:
     command: ["--mode=migrate"]
     environment:
       DATABASE_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      <<: *log-env
+    volumes:
+      # migrate 本来不需要任何卷（迁移文件是 go:embed 编进二进制的），
+      # 只有日志要落盘。它的日志反而是三个里最值得留的：一次性任务、restart: "no"、
+      # 在任何东西启动之前就跑完，静默失败会让整个 stack 都起不来。
+      - ${LOG_HOST_DIR:-./logs}:/data/logs
     depends_on:
       db:
         condition: service_healthy
@@ -75,8 +107,10 @@ services:
       # 用 depends_on 把 api 拦住，等于让一个可选能力决定整个平台能不能起来。
       # 边车没就绪时 api 照常提供其余功能，只有语义检索返回「服务暂不可用」。
       EMBED_URL: http://embed:8000
+      <<: *log-env
     volumes:
       - uploads:/data/uploads
+      - ${LOG_HOST_DIR:-./logs}:/data/logs
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -100,8 +134,10 @@ services:
       DATABASE_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
       UPLOAD_DIR: /data/uploads
       EMBED_URL: http://embed:8000
+      <<: *log-env
     volumes:
       - uploads:/data/uploads
+      - ${LOG_HOST_DIR:-./logs}:/data/logs
     depends_on:
       migrate:
         condition: service_completed_successfully

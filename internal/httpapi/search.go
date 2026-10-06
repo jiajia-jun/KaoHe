@@ -3,12 +3,12 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"KaoHe/internal/snippet"
 	"KaoHe/internal/store"
@@ -125,7 +125,7 @@ func (s *Server) searchSemantic(c *gin.Context) {
 	// 服务本身是好的，只是这一条检索能力暂时不可用，界面要能把这件事说清楚。
 	vectors, err := s.embed.Embed(c.Request.Context(), []string{query})
 	if err != nil {
-		slog.Error("语义检索：查询向量化失败", "err", err)
+		LoggerFrom(c).Error("语义检索：查询向量化失败", zap.Error(err))
 		fail(c, http.StatusServiceUnavailable, codeUnavailable,
 			"向量服务暂不可用，语义检索无法进行；关键词检索和文件管理不受影响")
 		return

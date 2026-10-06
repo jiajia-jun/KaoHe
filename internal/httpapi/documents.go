@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
+	"go.uber.org/zap"
 
 	"KaoHe/internal/filekind"
 	"KaoHe/internal/store"
@@ -116,11 +116,21 @@ func (s *Server) createDocument(c *gin.Context) {
 	if err := s.store.CreateDocument(c.Request.Context(), doc, enqueueIndex); err != nil {
 		// 写库失败就回滚磁盘，否则会留下一个没有任何记录指向的孤儿文件
 		if rmErr := s.storage.RemoveMany(docUID); rmErr != nil {
-			slog.Error("回滚已落盘文件失败", "docUID", docUID, "err", rmErr)
+			LoggerFrom(c).Error("回滚已落盘文件失败",
+				zap.String("docUID", docUID), zap.Error(rmErr))
 		}
 		failInternal(c, err)
 		return
 	}
+
+	// 入队这条日志是跨文件排查的连接点：worker 处理这份文档时记的是同一个
+	// documentId（外加 jobId），两个日志文件靠它串起来。
+	// 没有这一行，「上传成功但一直没索引」就只能翻库才知道该去 grep 哪个 id。
+	LoggerFrom(c).Info("文档已入库",
+		zap.Int64("documentId", doc.ID),
+		zap.String("docUID", doc.DocUID),
+		zap.Bool("enqueued", enqueueIndex),
+	)
 
 	c.JSON(http.StatusCreated, doc)
 }
@@ -172,7 +182,10 @@ func (s *Server) downloadDocument(c *gin.Context) {
 	if err != nil {
 		// 记录在库但盘上没有文件，这是“原文件丢失”，与索引失败是两回事，
 		// 必须给出不同的原因，否则排障时会指错方向。
-		slog.Error("原文件缺失", "docUID", doc.DocUID, "storageKey", doc.StorageKey, "err", err)
+		LoggerFrom(c).Error("原文件缺失",
+			zap.String("docUID", doc.DocUID),
+			zap.String("storageKey", doc.StorageKey),
+			zap.Error(err))
 		fail(c, http.StatusNotFound, codeNotFound, "原文件已丢失，无法下载")
 		return
 	}
@@ -321,7 +334,7 @@ func (s *Server) purgeDocument(c *gin.Context) {
 		s.respondLoadError(c, err)
 		return
 	}
-	s.purgeFiles([]store.Document{*doc})
+	s.purgeFiles(LoggerFrom(c), []store.Document{*doc})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": fmt.Sprintf("「%s」已彻底删除", doc.Name),
@@ -338,7 +351,7 @@ func (s *Server) emptyTrash(c *gin.Context) {
 		failInternal(c, err)
 		return
 	}
-	s.purgeFiles(docs)
+	s.purgeFiles(LoggerFrom(c), docs)
 
 	c.JSON(http.StatusOK, gin.H{
 		"purged":  len(docs),
@@ -351,11 +364,13 @@ func (s *Server) emptyTrash(c *gin.Context) {
 // 失败只记日志、不往外报：库里的记录已经删掉了，这一步失败留下的是一个谁也不引用
 // 的目录。把一次已经完成的删除报成失败，会让用户反复重试一个无事可做的动作，
 // 而他重试时看到的仍然是「文件不在了」——两次提示互相矛盾，比一个孤儿目录更糟。
-func (s *Server) purgeFiles(docs []store.Document) {
+// log 由调用方传入：这里没有 *gin.Context，而日志必须带上 requestId
+// 才能和触发这次清理的那个请求对上。两个调用点都拿得到 c，穿透来即可。
+func (s *Server) purgeFiles(log *zap.Logger, docs []store.Document) {
 	for _, doc := range docs {
 		if err := s.storage.RemoveMany(doc.DocUID); err != nil {
-			slog.Error("彻底删除后清理磁盘目录失败，留下孤儿目录",
-				"docUID", doc.DocUID, "err", err)
+			log.Error("彻底删除后清理磁盘目录失败，留下孤儿目录",
+				zap.String("docUID", doc.DocUID), zap.Error(err))
 		}
 	}
 }
