@@ -1,0 +1,31 @@
+# 出题方题面材料（要求 PNG 与早期草稿），不属于交付物
+/target/
+
+# 环境变量与密钥：仓库内只允许存在 .env.example
+.env
+.env.*
+!.env.example
+
+# 前端
+node_modules/
+dist/
+web/node_modules/
+web/dist/
+
+# Go
+*.exe
+*.test
+*.out
+/bin/
+/tmp/
+
+# 容器持久化数据（运行期由 Docker 具名卷承载，此处仅防本地直跑残留）
+/data/
+/uploads/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
