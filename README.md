@@ -1,11 +1,16 @@
 # 文件管理与知识检索平台
 
 解决文件分散、分类混乱、查找困难和归档后难以复用的问题。
-支持文件的**上传、整理、检索、下载与归档**，并通过**真实的文本向量**提供语义检索。
+支持文件的**上传、整理、检索、下载、归档与删除**，并通过**真实的文本向量**提供语义检索。
 
 > 交付物索引：架构设计与关键取舍见 [`docs/DESIGN.md`](docs/DESIGN.md)，
 > 测试与验收说明见 [`SELF-CHECK.md`](SELF-CHECK.md)，
 > 5 组自然语言检索示例见 [`docs/RETRIEVAL-EXAMPLES.md`](docs/RETRIEVAL-EXAMPLES.md)。
+>
+> **已知边界**：PDF 当前只做存储与在线预览，正文索引是**待补的功能**而非设计取舍 ——
+> 验收语料的 PDF 正文实际取得到（见 [`docs/DESIGN.md`](docs/DESIGN.md) §3.5 的更正）；
+> 没有身份认证，任何能访问该端口的人都能读写全部文件。
+> 其余没有验到的部分集中在 [`SELF-CHECK.md`](SELF-CHECK.md) §6。
 
 ---
 
@@ -56,9 +61,18 @@ docker compose down
 | 5 | 知识检索 →「关键词检索」 | 搜 `发布检查清单`：文件名命中的排在前面，正文提到的也带出片段 |
 | 6 | 知识检索 →「语义检索」 | 输入 `容器起来了但是服务还是用不了`（整句在关键词检索里 0 命中） |
 | 7 | 文件管理 | 把某个文件**归档**，它会从默认列表消失，切到「已归档」标签页还能找到 |
+| 8 | 文件管理 | 点某行的**删除**：文件移入**回收站**，提示里带一个「撤销」；切到「回收站」标签页可以**恢复**或**彻底删除** |
+| 9 | 文件管理 | 在回收站里点**清空回收站**，会先弹一个红色确认框 —— 这一步不可逆 |
 
 第 6 步是这套系统最值得看的一处：**用与原文完全不同的措辞，找到对应的文档和片段。**
 完整的 5 组示例（含预期命中的文件）见 [`docs/RETRIEVAL-EXAMPLES.md`](docs/RETRIEVAL-EXAMPLES.md)。
+
+第 8、9 步值得单独说一句：**删除是两步的，而且两步的强度刻意不同。**
+「删除」只是把文件移进回收站，原文件、分类归属和已经建好的索引一个都不动，
+所以它不弹确认框、反而给一个撤销入口 —— 拦一道只会让人对着能撤销的操作犹豫。
+真正毁掉数据的动作（彻底删除、清空回收站）才弹红色确认框，并且文案里写明「无法恢复」。
+分类的删除则是硬删除，但入口改成每行常显的图标按钮：删除入口藏在悬停菜单后面时，
+用户找不到它只会得出「这个功能没有」的结论，那和不提供删除按钮是等价的。
 
 ---
 
@@ -117,7 +131,42 @@ docker compose down
 
 ---
 
-## 五、排障
+## 五、接口一览
+
+对外接口统一挂在 `/api/v1` 下，只有容器健康检查 `/healthz` 例外
+（它由 compose 直接打 `api`，不经过 nginx）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/healthz` | 健康检查；数据库不可达时返回 503，前端首页据此显示链路状态 |
+| GET | `/config` | 上传上限、支持的格式，前端据此做前置校验 |
+| POST | `/documents` | 上传（multipart） |
+| GET | `/documents` | 列表；`q`、`categoryId`、`uncategorized`、`archived`、`trashed` 可组合 |
+| GET | `/documents/:id` | 详情 |
+| PATCH | `/documents/:id` | 改名 / 改标签 / 改归属分类 / 归档 / 恢复 |
+| GET | `/documents/:id/download` | 下载；`?inline=true` 供 PDF 在线预览（支持 Range） |
+| POST | `/documents/:id/reindex` | 重新索引 |
+| DELETE | `/documents/:id` | **移入回收站**，可撤销 |
+| POST | `/documents/:id/restore` | 从回收站恢复 |
+| DELETE | `/documents/:id/purge` | **彻底删除**，仅对回收站中的文件生效 |
+| DELETE | `/trash` | 清空回收站，返回清掉的条数 |
+| GET | `/search` | 关键词检索（文件名 + 正文） |
+| POST | `/search/semantic` | 语义检索 |
+| GET / POST | `/categories` | 分类树 / 新建分类 |
+| PATCH / DELETE | `/categories/:id` | 改名 / 移动 / 删除分类 |
+
+删除为什么是两步：`DELETE /documents/:id` 只是打上 `deleted_at`，
+原文件与已经建好的索引都还在，随时可以恢复；`/purge` 才是真的抹掉。
+**彻底删除只对回收站里的文件生效** —— 对一份使用中的文件直接调 `/purge` 会拿到 409，
+必须先移入回收站。多出来的这一步不是仪式，它保证误删永远有一步可以停下来。
+
+回收站里的文件在**列表、关键词检索、语义检索**三处都不可见。
+这三个入口共用同一个过滤条件，因此不存在「删掉了但还能被搜出来」这种漏法 ——
+一处漏掉比没有删除功能更糟。
+
+---
+
+## 六、排障
 
 **页面打不开** —— 先看容器状态与日志，不要一上来就重建数据库：
 
@@ -135,6 +184,11 @@ docker compose logs --tail=100 web
 
 **文件上传成功但搜不到内容** —— 看列表的「索引状态」列。若是「索引失败」，
 打开详情抽屉能看到失败原因，并点「重新索引」。原文件始终在，下载不受影响。
+「仅存储」是 PDF 的当前状态，不是失败 —— PDF 正文索引尚未接上（见 §3.5）。
+
+**删掉的文件想找回来** —— 文件列表上切到「回收站」标签页，点该行的「恢复」。
+注意「彻底删除」与「清空回收站」是不可逆的，历史文件不会保留副本；
+误删之后应尽快恢复，不要先清空回收站。
 
 **容器重建后资料不见了** —— 核对是否误用了 `docker compose down -v`，
 以及 compose 项目名是否被改动（改名会让应用连到另一组新卷上）。
@@ -144,7 +198,7 @@ docker compose logs --tail=100 web
 
 ---
 
-## 六、目录结构
+## 七、目录结构
 
 ```text
 .
@@ -163,12 +217,12 @@ docker compose logs --tail=100 web
 │   ├── model/             bge-small-zh-v1.5 的 int8 ONNX 产物
 │   └── tools/             模型导出脚本
 ├── scripts/
-│   ├── acceptance_api.py      接口层验收脚本（27 节，含 5 组语义检索示例的断言）
+│   ├── acceptance_api.py      接口层验收脚本（28 节，含回收站与 5 组语义检索示例的断言）
 │   ├── clean_start_smoke.py   空库从零启动的冒烟（迁移 + 10 份语料走完整链路）
 │   ├── semantic_examples.py   5 组自然语言检索示例的复现脚本
 │   └── persistence_check.py   容器重建前后的数据比对（停机由人工执行）
 ├── web/                   Vue 3 + Vite + TypeScript 前端
-│   ├── e2e/               Playwright 端到端用例（27 条）
+│   ├── e2e/               Playwright 端到端用例（29 条）
 │   └── Dockerfile         构建前端并打包进 nginx 镜像
 ├── testdata/corpus/       验收用测试文档（10 份）
 ├── docs/                  架构设计、检索示例
@@ -180,7 +234,7 @@ docker compose logs --tail=100 web
 
 ---
 
-## 七、自测
+## 八、自测
 
 系统起来之后，按下面的顺序跑：
 
@@ -188,9 +242,9 @@ docker compose logs --tail=100 web
 gofmt -l . && go vet ./... && golangci-lint run ./...   # 静态检查
 go test ./internal/...                                  # 单元测试（25 条）
 
-python scripts/acceptance_api.py          # 接口层验收（238 条断言）
+python scripts/acceptance_api.py          # 接口层验收（274 条断言）
 python scripts/semantic_examples.py --reset   # 5 组检索示例
-cd web && npx playwright test             # 浏览器端到端（27 条）
+cd web && npx playwright test             # 浏览器端到端（29 条）
 ```
 
 上面这些都在**已有数据的卷**上跑。还有两件必须单独做的事：
@@ -214,7 +268,7 @@ python scripts/persistence_check.py verify
 
 ---
 
-## 八、开发里程碑
+## 九、开发里程碑
 
 | 里程碑 | 内容 | 状态 |
 | --- | --- | --- |
@@ -225,5 +279,6 @@ python scripts/persistence_check.py verify
 | M5 | 关键词检索与语义检索 | ✅ 已完成 |
 | M6 | 异常态与交互反馈打磨 | ✅ 已完成 |
 | M7 | 交付文档、5 组检索示例与验证脚本 | ✅ 已完成 |
+| M8 | 删除与回收站：文件软删除 / 恢复 / 彻底删除，分类删除入口常显 | ✅ 已完成 |
 
 每一步都对应一次提交，提交信息里写明了该里程碑的取舍。
