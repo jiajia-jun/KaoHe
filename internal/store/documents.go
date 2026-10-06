@@ -115,9 +115,23 @@ LEFT JOIN categories c ON c.id = d.category_id
 WHERE d.doc_uid = ?`
 
 func (s *Store) GetDocument(ctx context.Context, docUID string) (*Document, error) {
+	return s.scanDocument(ctx, getSelect, docUID)
+}
+
+// GetDocumentByID 按自增主键取文档，供 worker 使用：
+// 索引任务里存的是 document_id，而 doc_uid 是给外部用的编号，两者不要混。
+func (s *Store) GetDocumentByID(ctx context.Context, id int64) (*Document, error) {
+	const query = `
+SELECT d.*, c.name AS category_name
+FROM documents d
+LEFT JOIN categories c ON c.id = d.category_id
+WHERE d.id = ?`
+	return s.scanDocument(ctx, query, id)
+}
+
+func (s *Store) scanDocument(ctx context.Context, query string, arg any) (*Document, error) {
 	var doc Document
-	err := s.db.WithContext(ctx).Raw(getSelect, docUID).Scan(&doc).Error
-	if err != nil {
+	if err := s.db.WithContext(ctx).Raw(query, arg).Scan(&doc).Error; err != nil {
 		return nil, fmt.Errorf("查询文档失败: %w", err)
 	}
 	if doc.ID == 0 {

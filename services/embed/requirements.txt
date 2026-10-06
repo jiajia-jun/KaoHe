@@ -1,0 +1,8 @@
+# 只装推理与分词所需的最小集合。
+# 特意不装 transformers / torch：那会把镜像从 ~250 MB 抬到 1 GB 以上，
+# 而这里需要的分词能力，tokenizer.json + tokenizers 已经完全具备。
+#
+# 版本与生成 ONNX 时所用的本地环境一致（见 tools/export_onnx.py），
+# 这样「校验过的组合」和「容器里跑的组合」是同一个，而不是看起来像。
+onnxruntime==1.30.0
+tokenizers==0.23.2

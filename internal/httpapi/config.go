@@ -5,6 +5,8 @@ import (
 	"sort"
 
 	"github.com/gin-gonic/gin"
+
+	"KaoHe/internal/filekind"
 )
 
 // GET /api/v1/config
@@ -14,10 +16,7 @@ import (
 // 如果自己再写一份常量，改了环境变量就会出现界面说一套、服务端做一套。
 // 所以把这份约束暴露成只读接口，界面提示与服务端校验同源。
 func (s *Server) getConfig(c *gin.Context) {
-	exts := make([]string, 0, len(supportedExtensions))
-	for ext := range supportedExtensions {
-		exts = append(exts, ext)
-	}
+	exts := filekind.SupportedExtensions()
 	sort.Strings(exts)
 
 	c.JSON(http.StatusOK, gin.H{

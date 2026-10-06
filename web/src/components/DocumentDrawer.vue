@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { errorText } from '@/api/client'
 import {
   archiveDocument,
   fetchDocumentBlob,
   getDocument,
+  isIndexing,
   openBlobInNewTab,
+  reindexDocument,
   restoreDocument,
   saveBlob,
   updateDocument,
@@ -58,6 +60,8 @@ const categoryOptions = computed(() =>
 )
 
 const isPdf = computed(() => doc.value?.contentType.startsWith('application/pdf') ?? false)
+/** not_supported 是设计上就不做正文索引，给它一个「重新索引」按钮只会误导用户 */
+const canReindex = computed(() => doc.value !== null && doc.value.indexStatus !== 'not_supported')
 const dirty = computed(
   () =>
     doc.value !== null &&
@@ -93,9 +97,47 @@ watch(
   () => [props.modelValue, props.documentId],
   ([open]) => {
     if (open) void load()
+    else stopWatchingIndex()
   },
   { immediate: true },
 )
+
+/**
+ * 索引在后台完成，抽屉里显示的状态会过时。
+ * 只要还停在待索引/索引中，就隔一会儿重新取一次详情；
+ * 状态落定（已索引 / 失败）就停下来，不在无人看的时候一直轮询。
+ */
+let indexTimer: ReturnType<typeof setTimeout> | undefined
+
+function stopWatchingIndex() {
+  if (indexTimer) clearTimeout(indexTimer)
+  indexTimer = undefined
+}
+
+function watchIndexProgress() {
+  stopWatchingIndex()
+  if (!props.modelValue || !doc.value || !isIndexing(doc.value.indexStatus)) return
+  indexTimer = setTimeout(async () => {
+    // 正在编辑时把用户填了一半的内容留出来。必须在 await 之前取：
+    // 请求返回后 doc.value 可能已经被别处替换过，那时再读就取到新值了。
+    const kept =
+      editing.value && doc.value ? { name: doc.value.name, tags: doc.value.tags } : null
+    try {
+      const fresh = await getDocument(props.documentId!)
+      doc.value = kept ? { ...fresh, ...kept } : fresh
+      if (!kept) resetDraft(fresh)
+      if (fresh.indexStatus === 'ready') ElMessage.success('索引已完成')
+      if (fresh.indexStatus === 'failed') ElMessage.error(`索引失败：${fresh.indexError ?? '未知原因'}`)
+      emit('changed', fresh)
+    } catch {
+      // 轮询失败不打扰用户，下一轮还会再试
+    }
+    watchIndexProgress()
+  }, 1200)
+}
+
+watch(() => doc.value?.indexStatus, watchIndexProgress)
+onUnmounted(stopWatchingIndex)
 
 /** 统一的动作包装：置忙、报错、把最新文档回传给父组件。 */
 async function run(action: () => Promise<DocumentItem>, successText: string) {
@@ -143,6 +185,11 @@ async function save() {
       }),
     '已保存',
   )
+}
+
+function reindex() {
+  if (!doc.value) return
+  void run(() => reindexDocument(doc.value!.id), '已提交重新索引')
 }
 
 function toggleArchive() {
@@ -217,8 +264,16 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
         <el-descriptions-item label="大小">{{ formatBytes(doc.sizeBytes) }}</el-descriptions-item>
 
         <el-descriptions-item label="索引状态">
-          <IndexStatusTag :status="doc.indexStatus" />
-          <div v-if="doc.indexError" class="doc-index-error">{{ doc.indexError }}</div>
+          <div class="index-line">
+            <IndexStatusTag :status="doc.indexStatus" />
+            <el-button v-if="canReindex" text type="primary" size="small" :loading="busy"
+              @click="reindex">
+              {{ doc.indexStatus === 'failed' ? '重新索引' : '重建索引' }}
+            </el-button>
+          </div>
+          <!-- 失败原因与「索引成功但有保留」都走这里：前者是错误，后者是提示 -->
+          <el-alert v-if="doc.indexError" class="doc-index-error" :closable="false" show-icon
+            :type="doc.indexStatus === 'failed' ? 'error' : 'warning'" :title="doc.indexError" />
         </el-descriptions-item>
 
         <el-descriptions-item label="状态">
@@ -267,10 +322,15 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
   width: 100%;
 }
 
+.index-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 颜色交给 el-alert 的 type，这里只管间距与换行 */
 .doc-index-error {
   margin-top: 6px;
-  font-size: 12px;
-  color: var(--el-color-danger);
   word-break: break-all;
 }
 

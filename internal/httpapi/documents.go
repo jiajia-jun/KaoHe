@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
 
+	"KaoHe/internal/filekind"
 	"KaoHe/internal/store"
 )
 
@@ -25,22 +26,9 @@ const (
 	maxTagRunes  = 32
 )
 
-// supportedExtensions 是允许上传的格式。target 要求至少覆盖 PDF、TXT、Markdown。
+// 允许的格式与各自的能力边界来自 filekind：worker 抽取正文时用的是同一份定义，
+// 两边各写一份清单迟早会漏改一处，出现「上传时说会索引、取任务时又不认」。
 // 判定以扩展名为准，不做 MIME 嗅探 —— 这一取舍记在 docs/DESIGN.md 的已知限制里。
-var supportedExtensions = map[string]string{
-	".pdf":      "application/pdf",
-	".txt":      "text/plain; charset=utf-8",
-	".md":       "text/markdown; charset=utf-8",
-	".markdown": "text/markdown; charset=utf-8",
-}
-
-// extractableExtensions 是会被抽取正文并建立索引的格式。
-// PDF 本设计只做保存、下载与在线预览，因此标记为 not_supported 而非 failed。
-var extractableExtensions = map[string]bool{
-	".txt":      true,
-	".md":       true,
-	".markdown": true,
-}
 
 // POST /api/v1/documents
 func (s *Server) createDocument(c *gin.Context) {
@@ -73,7 +61,7 @@ func (s *Server) createDocument(c *gin.Context) {
 	}
 
 	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
-	contentType, supported := supportedExtensions[ext]
+	kind, supported := filekind.Lookup(ext)
 	if !supported {
 		fail(c, http.StatusBadRequest, codeUnsupported,
 			"暂不支持该文件格式，目前支持 PDF、TXT、Markdown（.pdf / .txt / .md）")
@@ -112,7 +100,7 @@ func (s *Server) createDocument(c *gin.Context) {
 		DocUID:        docUID,
 		Name:          sanitizeFileName(fileHeader.Filename),
 		StorageKey:    storageKey,
-		ContentType:   contentType,
+		ContentType:   kind.ContentType,
 		SizeBytes:     size,
 		CategoryID:    categoryID,
 		Tags:          tags,
@@ -120,7 +108,7 @@ func (s *Server) createDocument(c *gin.Context) {
 		IndexStatus:   store.IndexPending,
 	}
 
-	enqueueIndex := extractableExtensions[ext]
+	enqueueIndex := filekind.IsExtractable(ext)
 	if !enqueueIndex {
 		doc.IndexStatus = store.IndexNotSupported
 	}

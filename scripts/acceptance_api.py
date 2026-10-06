@@ -24,8 +24,8 @@ import json
 import pathlib
 import subprocess
 import sys
+import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 
@@ -36,6 +36,22 @@ DEFAULT_BASE = "http://127.0.0.1:8080/api/v1"
 MD = "06_星桥项目_故障复盘_2026-09-21.md"
 PDF = "10_文档分类与归档规范_v1.0.pdf"
 OTHER = "01_代码提交规范_v2.1.md"
+
+# 全部语料：7 份可抽取正文（md/txt）+ 3 份 PDF（只存不索引）
+TEXT_CORPUS = [
+    "01_代码提交规范_v2.1.md",
+    "02_发布检查清单_v1.4.md",
+    "03_文件服务接口约定_v1.2.md",
+    "05_星桥项目_发布检查清单_2026-09-18.txt",
+    "06_星桥项目_故障复盘_2026-09-21.md",
+    "07_星桥项目_用户访谈纪要_2026-09-12.txt",
+    "09_本地部署故障排查_v1.3.txt",
+]
+PDF_CORPUS = [
+    "04_星桥项目_需求与范围_v1.0.pdf",
+    "08_检索技术说明_关键词与语义_v1.0.pdf",
+    "10_文档分类与归档规范_v1.0.pdf",
+]
 
 PASS = 0
 FAIL = 0
@@ -127,6 +143,54 @@ def sql(query: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"查询失败：{result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def doc_pk(uid: str) -> int:
+    """把对外标识 doc_xxx 换成表里的数字主键。
+
+    直接查库时才用得上：document_chunks / index_jobs 的外键指向数字主键，
+    而接口对外只用 doc_uid，两者不能混着写进 SQL。
+    """
+    return int(sql(f"SELECT id FROM documents WHERE doc_uid = '{uid}'"))
+
+
+def compose(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["docker", "compose", *args], capture_output=True, text=True, cwd=REPO_ROOT
+    )
+
+
+def wait_index(doc_id: str, want: set[str], timeout: float = 90.0) -> str:
+    """轮询文档状态直到落在 want 里，返回最后看到的状态。
+
+    索引是后台异步做的，接口本身是同步返回的，所以这里必须轮询 ——
+    这也正是验收条件里「文件应显示索引处理状态」的实际形态。
+    """
+    deadline = time.monotonic() + timeout
+    seen = "未知"
+    while time.monotonic() < deadline:
+        _, doc, _ = call("GET", f"/documents/{doc_id}")
+        seen = doc["indexStatus"]
+        if seen in want:
+            return seen
+        time.sleep(0.3)
+    return seen
+
+
+def wait_all_index(doc_ids: list[str], timeout: float = 180.0) -> None:
+    """等到这批文档全部脱离 pending/processing 为止。"""
+    deadline = time.monotonic() + timeout
+    remaining = set(doc_ids)
+    while remaining and time.monotonic() < deadline:
+        _, listing, _ = call("GET", "/documents?pageSize=100")
+        unsettled = {
+            d["id"]
+            for d in listing["items"]
+            if d["indexStatus"] in ("pending", "processing")
+        }
+        remaining = unsettled & set(doc_ids)
+        if remaining:
+            time.sleep(0.4)
 
 
 def reset() -> None:
@@ -369,6 +433,149 @@ def main() -> int:
     chk("  移出文件数为 0", result["movedDocuments"], 0)
     chk("删除「研发」200", call("DELETE", f"/categories/{root_id}")[0], 200)
     chk("分类树已空", len(call("GET", "/categories")[1]["items"]), 0)
+
+    print("== 17. 索引：从待索引异步走到已索引 ==")
+    # 第 1 节已经断言了上传后立刻是 pending；这里要验的是后台会把它推到终态。
+    reached = wait_index(uid, {"ready", "failed"})
+    chk("最终落到 ready", reached, "ready")
+    _, doc, _ = call("GET", f"/documents/{uid}")
+    uid_pk = doc_pk(uid)
+    chk("索引失败的说明已清空", doc["indexError"], None)
+    chk("已生成正文片段", int(sql(f"SELECT count(*) FROM document_chunks WHERE document_id={uid_pk}")) > 0, True)
+    chk(
+        "片段向量维数是 512",
+        sql(f"SELECT DISTINCT vector_dims(embedding) FROM document_chunks WHERE document_id={uid_pk}"),
+        "512",
+    )
+    chk(
+        "片段正文非空",
+        sql(f"SELECT count(*) FROM document_chunks WHERE document_id={uid_pk} AND content <> ''"),
+        sql(f"SELECT count(*) FROM document_chunks WHERE document_id={uid_pk}"),
+    )
+    chk("任务已标记 done", sql(f"SELECT status FROM index_jobs WHERE document_id={uid_pk}"), "done")
+
+    print("== 18. 索引：PDF 只存不索引 ==")
+    pdf_pk = doc_pk(pdf_doc["id"])
+    chk("PDF 的 indexStatus", pdf_doc["indexStatus"], "not_supported")
+    chk("PDF 没有索引任务", sql(f"SELECT count(*) FROM index_jobs WHERE document_id={pdf_pk}"), "0")
+    chk("PDF 没有正文片段", sql(f"SELECT count(*) FROM document_chunks WHERE document_id={pdf_pk}"), "0")
+    status, err, _ = call("POST", f"/documents/{pdf_doc['id']}/reindex")
+    chk("对 PDF 触发重新索引 400", status, 400)
+    chk("错误码", err["code"], "bad_request")
+    chk("  提示说明了原因", "格式" in err["message"] or "支持" in err["message"], True)
+
+    print("== 19. 索引：重新索引幂等 ==")
+    chk("重新索引不存在的文档 404", call("POST", "/documents/doc_0000000000000000/reindex")[0], 404)
+
+    # 先把 worker 停下来再连点两次：否则第一次很可能在两次调用之间就被处理完了，
+    # 「没有产生第二个任务」就可能只是因为第一个已经 done，而不是因为接口幂等。
+    compose("stop", "worker")
+    try:
+        status, first, _ = call("POST", f"/documents/{uid}/reindex")
+        chk("重新索引 200", status, 200)
+        chk("状态回到 pending", first["indexStatus"], "pending")
+        chk("上一次的失败说明被清掉", first["indexError"], None)
+        chk("连点第二次仍 200", call("POST", f"/documents/{uid}/reindex")[0], 200)
+        chk(
+            "同一文档只有 1 个进行中的任务",
+            sql(f"SELECT count(*) FROM index_jobs WHERE document_id={uid_pk} AND status IN ('queued','running')"),
+            "1",
+        )
+    finally:
+        compose("start", "worker")
+
+    chk("worker 恢复后重新索引完成", wait_index(uid, {"ready", "failed"}), "ready")
+    chk(
+        "重建后片段仍在",
+        int(sql(f"SELECT count(*) FROM document_chunks WHERE document_id={uid_pk}")) > 0,
+        True,
+    )
+
+    print("== 20. 索引失败：重试、终态与原因 ==")
+    # 只有空白字符的文本抽不出任何正文，是构造「索引失败」最省事也最真实的办法。
+    status, blank_doc, _ = call(
+        "POST",
+        "/documents",
+        files={"file": ("空白.txt", "   \n\t\n".encode("utf-8"), "text/plain")},
+    )
+    chk("上传空白文本 201", status, 201)
+    chk("初始为 pending", blank_doc["indexStatus"], "pending")
+    blank_pk = doc_pk(blank_doc["id"])
+    # 把上限压到 1，第一次失败就是终态；否则默认要等 15s + 30s 两轮退避
+    sql(f"UPDATE index_jobs SET max_attempts=1 WHERE document_id={blank_pk}")
+    chk("最终落到 failed", wait_index(blank_doc["id"], {"failed"}), "failed")
+    _, failed_doc, _ = call("GET", f"/documents/{blank_doc['id']}")
+    chk("带上了失败原因", (failed_doc["indexError"] or "") != "", True)
+    chk("失败的任务记为 failed", sql(f"SELECT status FROM index_jobs WHERE document_id={blank_pk}"), "failed")
+    chk("失败时没有留下半份片段", sql(f"SELECT count(*) FROM document_chunks WHERE document_id={blank_pk}"), "0")
+
+    print("== 21. 索引失败不影响原文件的保存与下载 ==")
+    status, blob, _ = call("GET", f"/documents/{blank_doc['id']}/download")
+    chk("索引失败的文件仍可下载", status, 200)
+    chk("内容与原文件逐字节一致", blob, "   \n\t\n".encode("utf-8"))
+    _, listing, _ = call("GET", "/documents?pageSize=100")
+    chk("仍出现在列表里", any(d["id"] == blank_doc["id"] for d in listing["items"]), True)
+    _, still, _ = call("GET", f"/documents/{blank_doc['id']}")
+    chk("没有被自动归档", still["archived"], False)
+
+    print("== 22. 索引失败后重试可以成功 ==")
+    status, retry_doc, _ = upload(OTHER)
+    chk("上传一份可抽取正文的 Markdown 201", status, 201)
+    chk("先正常索引成功", wait_index(retry_doc["id"], {"ready", "failed"}), "ready")
+    retry_pk = doc_pk(retry_doc["id"])
+    # 手工把它按回失败态，模拟「上一次因为边车没起来而失败」的历史记录。
+    # 原因用 ASCII：这串字要经过 docker compose exec 传给 psql，
+    # 而 Windows 上非 ASCII 的命令行参数不保证原样到达。
+    sql(
+        f"UPDATE documents SET index_status='failed', index_error='simulated failure' WHERE id={retry_pk};"
+        f"UPDATE index_jobs SET status='failed' WHERE document_id={retry_pk}"
+    )
+    _, back, _ = call("GET", f"/documents/{retry_doc['id']}")
+    chk("已置为 failed", back["indexStatus"], "failed")
+    status, queued, _ = call("POST", f"/documents/{retry_doc['id']}/reindex")
+    chk("重试接口 200", status, 200)
+    chk("状态回到 pending", queued["indexStatus"], "pending")
+    chk("重试后成功", wait_index(retry_doc["id"], {"ready", "failed"}), "ready")
+    _, done, _ = call("GET", f"/documents/{retry_doc['id']}")
+    chk("失败原因已被清掉", done["indexError"], None)
+    chk("重新生成了片段", int(sql(f"SELECT count(*) FROM document_chunks WHERE document_id={retry_pk}")) > 0, True)
+
+    print("== 23. 全部语料：7 份可检索 + 3 份仅存储 ==")
+    corpus_docs = {}
+    for name in TEXT_CORPUS + PDF_CORPUS:
+        status, item, _ = upload(name)
+        chk(f"上传 {name}", status, 201)
+        corpus_docs[name] = item["id"]
+    wait_all_index(list(corpus_docs.values()))
+
+    _, listing, _ = call("GET", "/documents?pageSize=100")
+    by_name = {d["name"]: d for d in listing["items"]}
+    chk("文本语料全部 ready", [by_name[n]["indexStatus"] for n in TEXT_CORPUS], ["ready"] * len(TEXT_CORPUS))
+    chk("PDF 语料全部 not_supported", [by_name[n]["indexStatus"] for n in PDF_CORPUS], ["not_supported"] * len(PDF_CORPUS))
+    chk(
+        "没有任何一份停在中间态",
+        [d["indexStatus"] for d in listing["items"] if d["indexStatus"] in ("pending", "processing")],
+        [],
+    )
+    indexed = int(sql("SELECT count(*) FROM documents WHERE index_status='ready'"))
+    chk("可检索文档数 ≥ 7", indexed >= 7, True)
+    chk(
+        "所有片段都是 512 维",
+        sql(
+            "SELECT count(*) FROM document_chunks WHERE vector_dims(embedding) <> 512"
+        ),
+        "0",
+    )
+    chk(
+        "片段序号从 0 开始且连续",
+        sql(
+            "SELECT count(*) FROM ("
+            "  SELECT document_id, count(*) AS n, max(ordinal) AS mx, min(ordinal) AS mn"
+            "  FROM document_chunks GROUP BY document_id"
+            ") t WHERE mn <> 0 OR mx <> n - 1"
+        ),
+        "0",
+    )
 
     print(f"\n结果：PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0

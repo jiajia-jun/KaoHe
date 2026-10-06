@@ -24,6 +24,7 @@ import (
 	"KaoHe/internal/config"
 	"KaoHe/internal/db"
 	"KaoHe/internal/httpapi"
+	"KaoHe/internal/indexer"
 	"KaoHe/internal/migrate"
 	"KaoHe/internal/storage"
 	"KaoHe/internal/store"
@@ -59,11 +60,33 @@ func run(mode string) error {
 	case "api":
 		return runAPI(ctx, cfg)
 	case "worker":
-		// M4 实现：从 index_jobs 领取任务、调用 embed 边车、写入 document_chunks
-		return errors.New("worker 模式尚未实现（计划在 M4 落地）")
+		return runWorker(ctx, cfg)
 	default:
 		return fmt.Errorf("未知运行模式 %q，可选：api | worker | migrate", mode)
 	}
+}
+
+// runWorker 跑索引任务消费者。
+//
+// 与 api 共用同一个镜像和同一份数据卷：worker 要读原始文件才能抽取正文，
+// 而 api 已经把它写在了 uploads 卷上。
+func runWorker(ctx context.Context, cfg *config.Config) error {
+	gdb, err := db.Open(cfg.DatabaseDSN)
+	if err != nil {
+		return err
+	}
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		return fmt.Errorf("获取连接池失败: %w", err)
+	}
+	defer sqlDB.Close()
+
+	files, err := storage.New(cfg.UploadDir)
+	if err != nil {
+		return err
+	}
+
+	return indexer.NewWorker(store.New(gdb), files, indexer.NewEmbedder(cfg.EmbedURL)).Run(ctx)
 }
 
 func runAPI(ctx context.Context, cfg *config.Config) error {

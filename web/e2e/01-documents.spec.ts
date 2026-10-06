@@ -54,20 +54,26 @@ test('上传 Markdown：进入列表、标签与索引状态一并展示', async
   await expect(row).toContainText('故障')
   await expect(row).toContainText('复盘')
   await expect(row).toContainText('未分类')
-  // 尚无 worker 消费任务，Markdown 应停在“待索引”而不是“仅存储”
-  await expect(row).toContainText('待索引')
+  // 先确认没有被误标成「仅存储」：那是 PDF 的正常状态，出现在 Markdown 上就是错的
+  await expect(row).not.toContainText('仅存储')
+  // 索引在后台异步做，列表会自己把状态推进到终态 ——
+  // 这一步不需要手动刷新页面，正好验证了前端的轮询确实在工作。
+  await expect(row).toContainText('已索引', { timeout: 30_000 })
 })
 
 test('上传 TXT 与 PDF：PDF 标记为仅存储，不参与正文索引', async ({ page }) => {
   await page.goto('/documents')
   await uploadVia(page, corpus(TXT))
   await expect(page.getByText(`已上传「${TXT}」`)).toBeVisible()
-  await expect(rowOf(page, TXT)).toContainText('待索引')
+  await expect(rowOf(page, TXT)).toContainText('已索引', { timeout: 30_000 })
 
   const pdf = '10_文档分类与归档规范_v1.0.pdf'
   await uploadVia(page, corpus(pdf))
   await expect(page.getByText(`已上传「${pdf}」`)).toBeVisible()
   // PDF 不抽正文，是正常状态而非失败，界面必须把两者区分开
+  await expect(rowOf(page, pdf)).toContainText('仅存储')
+  // 它也不该被推进到「已索引」：等一会儿再确认一次，避免只是还没来得及变
+  await page.waitForTimeout(2000)
   await expect(rowOf(page, pdf)).toContainText('仅存储')
 })
 
@@ -113,7 +119,7 @@ test('点击行打开详情抽屉，信息与列表一致', async ({ page }) => 
   await expect(drawer).toContainText('3 KiB')
   await expect(drawer).toContainText('故障')
   await expect(drawer).toContainText('未分类')
-  await expect(drawer).toContainText('待索引')
+  await expect(drawer).toContainText('已索引', { timeout: 30_000 })
 })
 
 test('抽屉里改名与改标签后，列表同步更新', async ({ page }) => {
@@ -174,4 +180,52 @@ test('刷新页面后列表仍在（数据来自数据库而非内存）', async
   await page.reload()
   await expect(rowOf(page, MD)).toBeVisible()
   await expect(rowOf(page, '本地部署故障排查-已改名.txt')).toBeVisible()
+})
+
+/**
+ * 放在最后：它要等索引走到失败的终态，是这里最慢的一个用例。
+ *
+ * 默认 3 次尝试之间隔 15s / 30s 的退避，所以从上传到「索引失败」要 45 秒上下。
+ * 这个等待本身就是被测对象 —— 验收要求失败可重试、且失败不影响原文件，
+ * 那就得真的等到那个状态出现，而不是靠改库把它提前按下去。
+ */
+test('索引失败：状态与原因可见、可重试，且不影响下载', async ({ page }) => {
+  test.setTimeout(150_000)
+  await page.goto('/documents')
+
+  // 只有空白字符的文本抽不出任何正文，是构造「索引失败」最省事也最真实的输入
+  await page.getByRole('button', { name: '上传文件' }).click()
+  const dialog = page.locator('.el-dialog')
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name: '空白.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('   \n\t\n'),
+  })
+  await dialog.getByRole('button', { name: '开始上传' }).click()
+  await expect(page.getByText('已上传「空白.txt」')).toBeVisible()
+
+  const row = rowOf(page, '空白.txt')
+  await expect(row).toContainText('索引失败', { timeout: 90_000 })
+
+  await row.click()
+  const drawer = page.locator('.el-drawer')
+  await expect(drawer).toBeVisible()
+  await expect(drawer).toContainText('索引失败')
+  // 失败原因必须看得见，否则用户不知道该重试还是该换个文件
+  await expect(drawer.locator('.el-alert')).toContainText('正文')
+
+  // 失败只影响索引，原文件在上传时就已落盘，下载必须照常
+  const downloadPromise = page.waitForEvent('download')
+  await drawer.getByRole('button', { name: '下载' }).click()
+  const download = await downloadPromise
+  expect(download.suggestedFilename()).toBe('空白.txt')
+  const stream = await download.createReadStream()
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) chunks.push(chunk as Buffer)
+  expect(Buffer.concat(chunks).toString('utf8')).toBe('   \n\t\n')
+
+  // 重试入口可用：点下去要真的重新排队，而不是只弹一句提示
+  await drawer.getByRole('button', { name: '重新索引' }).click()
+  await expect(page.getByText('已提交重新索引')).toBeVisible()
+  await expect(drawer.getByText(/待索引|索引中/)).toBeVisible()
 })

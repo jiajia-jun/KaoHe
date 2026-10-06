@@ -1,0 +1,11 @@
+{
+  "source": "BAAI/bge-small-zh-v1.5",
+  "mirror": "ModelScope",
+  "license": "MIT",
+  "dimension": 512,
+  "pooling": "cls",
+  "normalize": "l2",
+  "max_tokens": 512,
+  "quantization": "dynamic int8 (QInt8 weights)",
+  "note": "由 services/embed/tools/export_onnx.py 生成"
+}

@@ -122,6 +122,22 @@ export function restoreDocument(id: string): Promise<DocumentItem> {
 }
 
 /**
+ * 重新索引。
+ *
+ * 接口是幂等的：已经有任务在排队或执行时不会另建一个，
+ * 因此界面上可以放心地在失败后反复重试。
+ */
+export async function reindexDocument(id: string): Promise<DocumentItem> {
+  const { data } = await http.post<DocumentItem>(`/documents/${encodeURIComponent(id)}/reindex`)
+  return data
+}
+
+/** 是否处于「后台正在处理」的中间态，界面据此决定要不要继续轮询。 */
+export function isIndexing(status: IndexStatus): boolean {
+  return status === 'pending' || status === 'processing'
+}
+
+/**
  * 取回原文件内容。
  *
  * 不用 <a href> 直接指到下载地址：那样一旦失败（例如原文件丢失返回 404），

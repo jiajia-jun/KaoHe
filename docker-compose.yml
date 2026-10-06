@@ -6,7 +6,8 @@
 # 设计要点：
 #   * 只暴露 web 一个宿主机端口，db/api/worker/embed 一律走 compose 内网。
 #   * api 与 worker 是同一个镜像的两个 --mode，避免重复构建。
-#   * migrate 是一次性任务，api 通过 service_completed_successfully 等它成功后才启动。
+#   * embed 单独一个镜像：它要 Python 与 ONNX Runtime，和静态 Go 二进制的基础镜像不同。
+#   * migrate 是一次性任务，api 与 worker 通过 service_completed_successfully 等它成功后才启动。
 #   * 数据全部落在具名卷 pgdata / uploads 上，容器重建不影响数据。
 
 name: kaohe
@@ -44,6 +45,19 @@ services:
     restart: "no"
     networks: [kaohe]
 
+  # 向量边车：跑 bge-small-zh-v1.5 的 ONNX 推理，只对内网提供 /embed
+  embed:
+    build:
+      context: ./services/embed
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks: [kaohe]
+
   api:
     image: kaohe-app
     build:
@@ -54,7 +68,6 @@ services:
       LISTEN_ADDR: ":8080"
       UPLOAD_DIR: /data/uploads
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-20971520}"
-      EMBED_URL: http://embed:8000
     volumes:
       - uploads:/data/uploads
     depends_on:
@@ -66,6 +79,29 @@ services:
       timeout: 5s
       retries: 20
       start_period: 5s
+    restart: unless-stopped
+    networks: [kaohe]
+
+  # 索引任务消费者。与 api 同一个镜像、同一份数据卷 ——
+  # 它要读 api 落盘的原始文件才能抽取正文。
+  worker:
+    image: kaohe-app
+    build:
+      context: .
+    command: ["--mode=worker"]
+    environment:
+      DATABASE_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      UPLOAD_DIR: /data/uploads
+      EMBED_URL: http://embed:8000
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      embed:
+        # 等边车真的能应答再起：worker 启动时会先做一次健康检查，
+        # 边车没就绪它会直接退出并重启，日志里会多出一串无意义的失败
+        condition: service_healthy
     restart: unless-stopped
     networks: [kaohe]
 

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { errorText } from '@/api/client'
 import {
   archiveDocument,
   fetchConfig,
   fetchDocumentBlob,
+  isIndexing,
   listDocuments,
   restoreDocument,
   saveBlob,
@@ -74,8 +75,12 @@ async function loadCategories() {
   }
 }
 
-async function load() {
-  phase.value = 'loading'
+/**
+ * silent 用于后台轮询：不切回加载态。
+ * 否则每 1.5 秒列表就会闪一次骨架屏，比状态更新本身更惹眼。
+ */
+async function load(silent = false) {
+  if (!silent) phase.value = 'loading'
   loadError.value = ''
   try {
     const current = parseCategoryKey(categoryKey.value)
@@ -93,13 +98,36 @@ async function load() {
     const lastPage = Math.max(1, Math.ceil(result.total / pageSize.value))
     if (page.value > lastPage) {
       page.value = lastPage
-      return load()
+      return load(silent)
     }
     phase.value = 'ready'
   } catch (err) {
+    // 轮询失败保留上一次的内容，只把错误留给下一次成功覆盖
+    if (silent) return
     phase.value = 'error'
     loadError.value = errorText(err)
+    return
   }
+  // 每次取到新数据都重新判断一次是否要继续跟：上传、切换筛选后同样要跟上
+  watchIndexProgress()
+}
+
+/**
+ * 索引在后台进行，列表上的状态会自己往前走。
+ * 只要还有文件停在待索引/索引中，就隔一会儿静默刷新一次；
+ * 全部落定后停下来，不留一个常驻的定时器。
+ */
+let indexTimer: number | undefined
+
+function stopIndexWatch() {
+  window.clearTimeout(indexTimer)
+  indexTimer = undefined
+}
+
+function watchIndexProgress() {
+  stopIndexWatch()
+  if (phase.value !== 'ready' || !items.value.some((item) => isIndexing(item.indexStatus))) return
+  indexTimer = window.setTimeout(() => void load(true), 1500)
 }
 
 onMounted(async () => {
@@ -111,6 +139,8 @@ onMounted(async () => {
   }
   await Promise.all([loadCategories(), load()])
 })
+
+onUnmounted(stopIndexWatch)
 
 // 搜索输入防抖：每敲一个字就发一次请求既浪费也会让结果闪烁
 let searchTimer: number | undefined
