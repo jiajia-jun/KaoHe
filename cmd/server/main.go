@@ -25,6 +25,8 @@ import (
 	"KaoHe/internal/db"
 	"KaoHe/internal/httpapi"
 	"KaoHe/internal/migrate"
+	"KaoHe/internal/storage"
+	"KaoHe/internal/store"
 )
 
 func main() {
@@ -75,9 +77,14 @@ func runAPI(ctx context.Context, cfg *config.Config) error {
 	}
 	defer sqlDB.Close()
 
+	files, err := storage.New(cfg.UploadDir)
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           httpapi.NewRouter(sqlDB, cfg),
+		Handler:           httpapi.NewRouter(cfg, store.New(gdb), files),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

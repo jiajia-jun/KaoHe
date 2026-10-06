@@ -3,7 +3,6 @@ package httpapi
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,17 +10,20 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"KaoHe/internal/config"
+	"KaoHe/internal/storage"
+	"KaoHe/internal/store"
 )
 
 type Server struct {
-	db  *sql.DB
-	cfg *config.Config
+	cfg     *config.Config
+	store   *store.Store
+	storage *storage.Store
 }
 
-func NewRouter(db *sql.DB, cfg *config.Config) *gin.Engine {
+func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
-	s := &Server{db: db, cfg: cfg}
+	s := &Server{cfg: cfg, store: st, storage: files}
 
 	r := gin.New()
 	r.Use(gin.Recovery(), accessLog())
@@ -31,7 +33,16 @@ func NewRouter(db *sql.DB, cfg *config.Config) *gin.Engine {
 
 	// 对外接口统一挂在 /api/v1 下；nginx 把 /api/ 反代到这里
 	api := r.Group("/api/v1")
-	api.GET("/healthz", s.health)
+	{
+		api.GET("/healthz", s.health)
+		api.GET("/config", s.getConfig)
+
+		api.POST("/documents", s.createDocument)
+		api.GET("/documents", s.listDocuments)
+		api.GET("/documents/:id", s.getDocument)
+		api.GET("/documents/:id/download", s.downloadDocument)
+		api.PATCH("/documents/:id", s.updateDocument)
+	}
 
 	return r
 }
@@ -61,7 +72,7 @@ func (s *Server) health(c *gin.Context) {
 		"time":    time.Now().Format(time.RFC3339),
 	}
 
-	if err := s.db.PingContext(ctx); err != nil {
+	if err := s.store.Ping(ctx); err != nil {
 		slog.Error("健康检查：数据库不可达", "err", err)
 		body["status"] = "degraded"
 		body["db"] = "down"
