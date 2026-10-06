@@ -1,3 +1,9 @@
+# 本项目最终运行在 Linux 容器里，工作区一律使用 LF。
+# 仓库被克隆到 Windows 时 core.autocrlf 默认会转成 CRLF，那会让将来的
+# shell 脚本在容器里报 bad interpreter，也会让 Dockerfile 的反斜杠续行失效。
+# 这里显式钉死 eol=lf，与克隆者的本地配置无关。
+* text=auto eol=lf
+
 # 测试语料必须逐字节保持原样：禁止任何换行符转换与文本归一化。
 # 这些文件是检索与断言脚本的输入，改动一个字节就可能让断言结果漂移。
 testdata/corpus/** -text
