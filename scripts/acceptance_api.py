@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -56,6 +57,13 @@ PDF_CORPUS = [
 PASS = 0
 FAIL = 0
 BASE_URL = DEFAULT_BASE
+
+# 传给 docker compose 的附加参数，用来指向另一个项目（例如用 -p kaoheclean
+# 起一套干净的栈做从零启动的冒烟）。默认是空的，也就是用 compose 的默认项目。
+#
+# sql() / reset() 这类操作会直接动容器的数据卷，如果脚本的接口地址指向 A 栈、
+# 而这两处按默认项目打到 B 栈上，就会一边读 A 一边清 B。所以项目名必须能一起指定。
+COMPOSE_ARGS: list[str] = []
 
 
 def chk(desc: str, got: object, want: object) -> None:
@@ -135,14 +143,17 @@ def upload(name: str, fields: dict | None = None):
 def sql(query: str) -> str:
     """直接查库，用于验证“不该落库的确实没落库”这类界面看不到的断言。"""
     result = subprocess.run(
-        ["docker", "compose", "exec", "-T", "db", "psql", "-U", "kaohe", "-d", "kaohe", "-tAc", query],
+        ["docker", "compose", *COMPOSE_ARGS, "exec", "-T", "db",
+         "psql", "-U", "kaohe", "-d", "kaohe", "-tAc", query],
         capture_output=True,
-        text=True,
         cwd=REPO_ROOT,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"查询失败：{result.stderr.strip()}")
-    return result.stdout.strip()
+        raise RuntimeError(f"查询失败：{result.stderr.decode('utf-8', 'replace').strip()}")
+    # 显式按 UTF-8 解码，不用 text=True：text=True 按本机 locale 解码，
+    # 在中文 Windows 上就是 GBK，任何一次带中文的查询都会在这里抛
+    # UnicodeDecodeError。数据库存的是 UTF-8，按 UTF-8 读回去才是对的。
+    return result.stdout.decode("utf-8", "replace").strip()
 
 
 def doc_pk(uid: str) -> int:
@@ -155,8 +166,11 @@ def doc_pk(uid: str) -> int:
 
 
 def compose(*args: str) -> subprocess.CompletedProcess:
+    # 不传 text=True：解码发生在 subprocess 的读取线程里，且是即刻的，
+    # 按本机 locale（中文 Windows 上是 GBK）解码，碰到非 UTF-8 字节就抛，
+    # 哪怕调用方根本不看输出（本脚本的四个调用点都不看）。
     return subprocess.run(
-        ["docker", "compose", *args], capture_output=True, text=True, cwd=REPO_ROOT
+        ["docker", "compose", *COMPOSE_ARGS, *args], capture_output=True, cwd=REPO_ROOT
     )
 
 
@@ -198,7 +212,8 @@ def reset() -> None:
     # 后面的分类用例就会带着上一轮的残留数据开始
     sql("TRUNCATE documents, index_jobs, document_chunks, categories RESTART IDENTITY CASCADE;")
     subprocess.run(
-        ["docker", "compose", "exec", "-T", "api", "sh", "-c", "rm -rf /data/uploads/*"],
+        ["docker", "compose", *COMPOSE_ARGS, "exec", "-T", "api",
+         "sh", "-c", "rm -rf /data/uploads/*"],
         capture_output=True,
         cwd=REPO_ROOT,
     )
@@ -576,6 +591,171 @@ def main() -> int:
         ),
         "0",
     )
+
+    print("== 24. 关键词检索 ==")
+    status, res, _ = call("GET", "/search?q=" + urllib.parse.quote("健康接口"))
+    chk("状态码", status, 200)
+    chk("只命中正文提到它的那一份", res["total"], 1)
+    hit = res["items"][0]
+    chk("  命中文件", hit["document"]["name"], "09_本地部署故障排查_v1.3.txt")
+    chk("  不是文件名命中", hit["nameHit"], False)
+    chk("  正文命中段数", hit["bodyHits"] >= 1, True)
+    chk("  片段里带了关键词", "健康接口" in hit["matches"][0]["text"], True)
+    chk("  片段两端有省略号", hit["matches"][0]["text"].startswith("…"), True)
+
+    status, res, _ = call("GET", "/search?q=" + urllib.parse.quote("发布检查清单"))
+    chk("按文件名也能命中", status, 200)
+    items = res["items"]
+    name_hits = [it["document"]["name"] for it in items if it["nameHit"]]
+    body_only = [it["document"]["name"] for it in items if not it["nameHit"]]
+    # 不写死命中份数：正文里提到过这个词的文档会随语料变化，
+    # 而这一节要验的是「文件名命中排在前面」「正文命中带得出片段」这两条规则。
+    chk("文件名命中的就这两份（排在前面）", name_hits,
+        ["05_星桥项目_发布检查清单_2026-09-18.txt", "02_发布检查清单_v1.4.md"])
+    chk("  它们确实排在最前面", [it["nameHit"] for it in items[:2]], [True, True])
+    chk("  其余都是正文命中", all(not it["nameHit"] for it in items[2:]), True)
+    chk("正文里提到它的包含访谈纪要", "07_星桥项目_用户访谈纪要_2026-09-12.txt" in body_only, True)
+    chk("每一条都带回了命中片段", all(len(it["matches"]) >= 1 for it in items), True)
+
+    chk("检索不存在的词返回空", call("GET", "/search?q=" + urllib.parse.quote("不存在的词xyz"))[1]["total"], 0)
+    chk("空关键词 400", call("GET", "/search?q=")[0], 400)
+    chk("关键词过长 400", call("GET", "/search?q=" + "x" * 201)[0], 400)
+    chk("非法分类筛选 400",
+        call("GET", "/search?q=" + urllib.parse.quote("检查") + "&categoryId=abc")[0], 400)
+
+    print("== 25. 语义检索 ==")
+    # 前面几节为了验归档和重试，留下了几份正文完全相同的副本
+    # （故障复盘-已改名.md、第二次上传的代码提交规范）。两份同样的内容谁排前面
+    # 本就并列，拿它验排序只会验出噪音。这里把第 23 节上传的那 7 份语料归到
+    # 一个分类下、检索时限定该分类，顺带把「语义检索也认分类筛选」一起验了。
+    _, semantic_cat_body, _ = call("POST", "/categories", json_body={"name": "语义验收语料"})
+    semantic_cat = semantic_cat_body["id"]
+    _, empty_cat_body, _ = call("POST", "/categories", json_body={"name": "语义验收空分类"})
+    empty_cat = empty_cat_body["id"]
+    for name in TEXT_CORPUS:
+        call("PATCH", f"/documents/{corpus_docs[name]}", json_body={"categoryId": semantic_cat})
+    _, scoped, _ = call("GET", f"/documents?pageSize=100&categoryId={semantic_cat}")
+    chk("语料已归入同一分类", sorted(d["name"] for d in scoped["items"]), sorted(TEXT_CORPUS))
+
+    # 与交付文档里的 5 组示例保持一致；scripts/semantic_examples.py 是这两处的可复现版本
+    examples = [
+        ("合并代码之前需要做什么检查", "01_代码提交规范_v2.1.md"),
+        ("容器起来了但是服务还是用不了", "09_本地部署故障排查_v1.3.txt"),
+        ("线上出故障之后要做哪些复盘", "06_星桥项目_故障复盘_2026-09-21.md"),
+        ("团队成员平时是怎么找文件的", "07_星桥项目_用户访谈纪要_2026-09-12.txt"),
+        ("发布之后怎么确认没问题", "05_星桥项目_发布检查清单_2026-09-18.txt"),
+    ]
+    for query, expected in examples:
+        status, res, _ = call(
+            "POST", "/search/semantic",
+            json_body={"query": query, "topK": 5, "categoryId": semantic_cat},
+        )
+        chk(f"「{query}」状态码", status, 200)
+        chk("  首位命中预期文件", res["items"][0]["document"]["name"], expected)
+        chk("  相似度高于阈值", res["items"][0]["score"] > res["minScore"], True)
+        chk("  返回了相关片段", len(res["items"][0]["matches"]) >= 1, True)
+        chk("  片段带相似度", isinstance(res["items"][0]["matches"][0].get("score"), float), True)
+        chk("  用的是同一套阈值", res["minScore"], 0.5)
+        # 关键词检索对整句是无效的：这正是语义检索要解决的那类提问
+        chk("  整句在关键词检索里检索不到",
+            call("GET", "/search?q=" + urllib.parse.quote(query))[1]["total"], 0)
+
+    # 向量检索永远会返回「最像的几条」，阈值是把它变成空结果的开关
+    status, res, _ = call("POST", "/search/semantic", json_body={"query": "合并代码", "minScore": 0.99})
+    chk("阈值调高到 0.99 后返回空", (status, res["total"]), (200, 0))
+
+    # 分类筛选在语义检索里同样生效：限定到一个空分类，再像的片段也不该漏出来
+    status, res, _ = call(
+        "POST", "/search/semantic",
+        json_body={"query": "合并代码之前需要做什么检查", "categoryId": empty_cat},
+    )
+    chk("限定到空分类时返回空", (status, res["total"]), (200, 0))
+
+    # 只有索引完成的文档才有向量，索引失败的文件不该出现在结果里
+    _, res, _ = call("POST", "/search/semantic", json_body={"query": "空白文本", "minScore": 0.01})
+    chk("索引失败的文件不会出现在语义检索里",
+        any(it["document"]["name"] == "空白.txt" for it in res["items"]), False)
+
+    chk("空描述 400", call("POST", "/search/semantic", json_body={"query": "  "})[0], 400)
+    chk("描述过长 400", call("POST", "/search/semantic", json_body={"query": "x" * 201})[0], 400)
+    chk("非法 JSON 400", call("POST", "/search/semantic", raw_body=b"oops", ctype="application/json")[0], 400)
+    chk("非法分类 400", call("POST", "/search/semantic",
+        json_body={"query": "发布", "categoryId": -1})[0], 400)
+
+    print("== 26. 向量边车不可用时的降级 ==")
+    # 边车还活着时先取一次关键词检索的结果，等下拿它跟停掉边车之后的比对
+    kw_query = "/search?q=" + urllib.parse.quote("健康接口")
+    kw_before = call("GET", kw_query)[1]
+
+    compose("stop", "embed")
+    try:
+        status, err, _ = call("POST", "/search/semantic", json_body={"query": "合并代码之前需要做什么检查"})
+        chk("语义检索 503", status, 503)
+        chk("错误码区别于内部错误", err["code"], "service_unavailable")
+        chk("  提示指向向量服务", "向量" in err["message"], True)
+
+        # 一个可选能力不可用，不该把文件管理和另一种检索一起拖下水。
+        #
+        # 比的是「停边车前后的同一次检索结果一致」，不写死命中份数：
+        # 这套数据同时会被浏览器端到端用例和使用者本人在界面上改动，
+        # 归档一份文件就会让命中数变，写死数字等于把别人的操作记成这里的失败。
+        # 这一节要验的本来就是「不受影响」，前后一致才是正题。
+        #
+        # （曾经写死过 total==1，验的是「健康接口」只出现在 09 里。09 一旦被归档，
+        #   这条就红，而应用的行为完全正确 —— 归档文件本就不该出现在检索结果里，
+        #   那正是第 27 节要验的验收条件。断言粒度选错，会把正确行为报成缺陷。）
+        _, kw_after, _ = call("GET", kw_query)
+        chk("关键词检索结果与停边车前一致",
+            [it["document"]["id"] for it in kw_after["items"]],
+            [it["document"]["id"] for it in kw_before["items"]])
+        # 结果集为空时「一致」是句废话，所以另按文件名搜一次本脚本自己造、
+        # 且全程未归档的那份文档，确认检索这条路是真通着的。
+        _, by_name, _ = call("GET", "/search?q=" + urllib.parse.quote("故障复盘-已改名"))
+        chk("按文件名仍搜得到本脚本的文档",
+            [it["document"]["id"] for it in by_name["items"]], [uid])
+        chk("文件列表不受影响", call("GET", "/documents?pageSize=100")[0], 200)
+        chk("下载不受影响", call("GET", f"/documents/{uid}/download")[0], 200)
+    finally:
+        compose("start", "embed")
+
+    # 等边车重新加载好模型再往下走，否则后面的用例会继续拿到 503
+    for _ in range(120):
+        if call("POST", "/search/semantic", json_body={"query": "发布检查清单"})[0] == 200:
+            break
+        time.sleep(0.5)
+    chk("边车恢复后语义检索可用",
+        call("POST", "/search/semantic", json_body={"query": "发布检查清单"})[0], 200)
+
+    # 验收条件原文：「归档文件不出现在默认列表和检索结果中，在归档区仍可找到；
+    # 恢复后可重新检索和下载」。上面第 9 节只验了列表那一半，检索这一半在这里补上。
+    print("== 27. 归档文件在检索里的可见性 ==")
+    target = corpus_docs["05_星桥项目_发布检查清单_2026-09-18.txt"]
+    _, before, _ = call("GET", "/search?q=" + urllib.parse.quote("发布检查清单"))
+    chk("归档前能被关键词检索到", any(it["document"]["id"] == target for it in before["items"]), True)
+
+    status, _, _ = call("PATCH", f"/documents/{target}", json_body={"archived": True})
+    chk("归档 200", status, 200)
+    try:
+        _, kw, _ = call("GET", "/search?q=" + urllib.parse.quote("发布检查清单"))
+        chk("归档后不出现在关键词检索里",
+            any(it["document"]["id"] == target for it in kw["items"]), False)
+        _, sem, _ = call("POST", "/search/semantic",
+                         json_body={"query": "发布之后怎么确认没问题", "topK": 10})
+        chk("归档后不出现在语义检索里",
+            any(it["document"]["id"] == target for it in sem["items"]), False)
+
+        # 「在归档区仍可找到」：归档区就是 archived=true 的那一份列表
+        _, arch, _ = call("GET", "/documents?pageSize=100&archived=true")
+        chk("在归档区仍能找到", any(d["id"] == target for d in arch["items"]), True)
+        status, blob, _ = call("GET", f"/documents/{target}/download")
+        chk("归档后仍可下载", (status, blob == (CORPUS / "05_星桥项目_发布检查清单_2026-09-18.txt").read_bytes()),
+            (200, True))
+    finally:
+        call("PATCH", f"/documents/{target}", json_body={"archived": False})
+
+    _, back, _ = call("GET", "/search?q=" + urllib.parse.quote("发布检查清单"))
+    chk("恢复后重新出现在检索结果里",
+        any(it["document"]["id"] == target for it in back["items"]), True)
 
     print(f"\n结果：PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0

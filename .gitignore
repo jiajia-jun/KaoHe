@@ -23,6 +23,14 @@ web/playwright-report/
 /bin/
 /tmp/
 
+# 验收脚本是 Python，跑过就会留下字节码缓存
+__pycache__/
+*.py[cod]
+
+# 持久化演练的中间快照：内容是「当时那台机器上的数据」，不该进仓库
+.persistence-snapshot.json
+docs/semantic-examples.json
+
 # 容器持久化数据（运行期由 Docker 具名卷承载，此处仅防本地直跑残留）
 /data/
 /uploads/
