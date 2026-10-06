@@ -1,0 +1,13 @@
+.git
+.gitignore
+.gitattributes
+target
+data
+uploads
+.env
+.env.*
+web/node_modules
+web/dist
+*.exe
+*.test
+*.out

@@ -1,0 +1,89 @@
+# 文件管理与知识检索平台 —— 本地部署编排
+#
+# 启动：cp .env.example .env && docker compose up --build
+# 停止：docker compose down          （不要加 -v，-v 会连数据卷一起删除）
+#
+# 设计要点：
+#   * 只暴露 web 一个宿主机端口，db/api/worker/embed 一律走 compose 内网。
+#   * api 与 worker 是同一个镜像的两个 --mode，避免重复构建。
+#   * migrate 是一次性任务，api 通过 service_completed_successfully 等它成功后才启动。
+#   * 数据全部落在具名卷 pgdata / uploads 上，容器重建不影响数据。
+
+name: kaohe
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?未设置：请先执行 cp .env.example .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?未设置：请先执行 cp .env.example .env}
+      POSTGRES_DB: ${POSTGRES_DB:?未设置：请先执行 cp .env.example .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 用 $$ 转义，避免 compose 在宿主机侧提前展开变量
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [kaohe]
+
+  # 一次性迁移任务：建扩展、建表、建索引。可重复执行，已应用的版本会跳过。
+  migrate:
+    image: kaohe-app
+    build:
+      context: .
+    command: ["--mode=migrate"]
+    environment:
+      DATABASE_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks: [kaohe]
+
+  api:
+    image: kaohe-app
+    build:
+      context: .
+    command: ["--mode=api"]
+    environment:
+      DATABASE_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      LISTEN_ADDR: ":8080"
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-20971520}"
+      EMBED_URL: http://embed:8000
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    networks: [kaohe]
+
+  web:
+    build:
+      context: ./web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [kaohe]
+
+volumes:
+  pgdata:
+  uploads:
+
+networks:
+  kaohe:
+    driver: bridge
