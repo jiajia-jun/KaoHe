@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -63,8 +64,7 @@ func (s *Server) createDocument(c *gin.Context) {
 	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
 	kind, supported := filekind.Lookup(ext)
 	if !supported {
-		fail(c, http.StatusBadRequest, codeUnsupported,
-			"暂不支持该文件格式，目前支持 PDF、TXT、Markdown（.pdf / .txt / .md）")
+		fail(c, http.StatusBadRequest, codeUnsupported, unsupportedExtMessage())
 		return
 	}
 
@@ -432,6 +432,23 @@ func (s *Server) purgeFiles(log *zap.Logger, docs []store.Document) {
 }
 
 // ---------------------------------------------------------------- 辅助函数
+
+// unsupportedExtMessage 拼出「不支持该格式」的 400 文案。
+//
+// 清单从 filekind 推导，而不是在这里写死一份 —— 写死的那份漂过：
+// .markdown 早在 registry 里注册了（filekind.go），文案却一直只写 .md，
+// 用户按提示把扩展名改成 .markdown 反而被拒，提示成了误导。
+//
+// 单独抽成函数是为了能被用例钉住（documents_test.go）：
+// 只要文案里的清单和 registry 对不上，用例就红，不必等到线上收到一个坏提示。
+//
+// 排序放在这里而不是 SupportedExtensions 里：那个函数遍历 map，本身顺序不稳定，
+// /config 也是在调用处排的（见 config.go），两处保持同一套做法。
+func unsupportedExtMessage() string {
+	exts := filekind.SupportedExtensions()
+	sort.Strings(exts)
+	return fmt.Sprintf("暂不支持该文件格式，目前支持 %s", strings.Join(exts, " / "))
+}
 
 // parseListFilter 解析列表与检索共用的筛选参数，失败时已写好 400 响应。
 func parseListFilter(c *gin.Context) (store.ListFilter, bool) {

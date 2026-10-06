@@ -47,3 +47,5 @@ docs/semantic-examples.json
 *.swp
 .DS_Store
 Thumbs.db
+
+CLAUDE.md

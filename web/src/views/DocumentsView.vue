@@ -621,12 +621,19 @@ async function undoMove(docId: string, name: string, categoryId: number | null) 
                el-table 会不会把原生事件透传到根节点，取决于它的 inheritAttrs 设置，
                包一层是确定的，也让「委托到整个表格」这件事在模板里看得见 -->
           <div class="table-wrap" @pointerdown="onTablePointerDown">
+          <!-- 列宽合计 918 是算出来的，不是试出来的。
+               1280×720 下表格容器只有 934px（视口 − el-main 40 − 分类栏 248 − 间距 16
+               − el-card 40），这 934 就是全部预算，而操作列右对齐 —— 一旦列宽合计超了，
+               「下载/归档/删除」会整排落到屏幕外，只能横向滚动表格才点得到。
+               Playwright 点击前会把元素滚进视口，所以浏览器用例抓不到这种溢出，
+               要靠 e2e/05-layout.spec.ts 里直接量 clientWidth/scrollWidth 的那条来钉。
+               各列取「实测的单行内容宽度 + 16 内边距」，多出来的余量全给文件名。 -->
           <el-table :data="items" row-key="id" class="table" @row-click="openDetail"
             :row-class-name="rowClassName">
             <!-- 抓手列：纯长按没有任何可见线索，而一个没人能发现的交互与不提供它
                  是等价的（CategoryTree 里对删除按钮写过同一句话）。它是显式入口，
                  按下即可拖；行内别处按住 380ms 同样能拖，两条路都留。 -->
-            <el-table-column v-if="tab !== 'trash'" width="34" class-name="col-grab">
+            <el-table-column v-if="tab !== 'trash'" width="38" class-name="col-grab">
               <template #default>
                 <span v-if="dragEnabled" class="doc-grab" aria-label="拖动调整位置"
                   title="按住拖动可调整位置，或拖到左侧分类上">
@@ -642,7 +649,7 @@ async function undoMove(docId: string, name: string, categoryId: number | null) 
               </template>
             </el-table-column>
 
-            <el-table-column label="文件名" min-width="240">
+            <el-table-column label="文件名" min-width="210">
               <template #default="{ row }">
                 <!-- data-doc-id 是拖拽的行锚点：el-table 不给 tr 挂自定义属性，
                      所以打在这一格上，需要行元素时再往上找它的 tr -->
@@ -655,35 +662,39 @@ async function undoMove(docId: string, name: string, categoryId: number | null) 
               </template>
             </el-table-column>
 
-            <el-table-column label="标签" min-width="140">
+            <el-table-column label="标签" min-width="64">
               <template #default="{ row }">
                 <el-tag v-for="tag in row.tags" :key="tag" size="small" class="tag">{{ tag }}</el-tag>
                 <span v-if="!row.tags.length" class="muted">—</span>
               </template>
             </el-table-column>
 
-            <el-table-column label="分类" min-width="110">
+            <el-table-column label="分类" min-width="104">
               <template #default="{ row }">
                 <span v-if="row.categoryName">{{ row.categoryName }}</span>
                 <span v-else class="muted">未分类</span>
               </template>
             </el-table-column>
 
-            <el-table-column label="大小" width="90">
+            <el-table-column label="大小" width="82">
               <template #default="{ row }">{{ formatBytes(row.sizeBytes) }}</template>
             </el-table-column>
 
-            <el-table-column label="索引状态" width="110">
+            <el-table-column label="索引状态" width="84">
               <template #default="{ row }">
                 <IndexStatusTag :status="row.indexStatus" />
               </template>
             </el-table-column>
 
-            <el-table-column label="上传时间" width="160">
+            <el-table-column label="上传时间" min-width="132">
               <template #default="{ row }">{{ formatDateTime(row.createdAt) }}</template>
             </el-table-column>
 
-            <el-table-column label="操作" width="220" align="right">
+            <!-- 204 是按回收站那一格定的：下载/恢复/彻底删除 三个按钮单行要 202px，
+                 比「使用中」的 下载/归档/删除 还宽 20px（「彻底删除」四个字）。
+                 操作列拿的是「绝不能退化」的预算 —— 按钮折行看起来像 bug，
+                 而文件名折行是正常排版，所以这 20px 从文件名身上挪。 -->
+            <el-table-column label="操作" width="204" align="right">
               <template #default="{ row }">
                 <!-- 阻止冒泡，否则点按钮会同时打开详情抽屉 -->
                 <el-button text type="primary" size="small" @click.stop="download(row)">下载</el-button>
@@ -790,6 +801,13 @@ async function undoMove(docId: string, name: string, categoryId: number | null) 
   width: 100%;
 }
 
+/* 单元格内边距 12 → 8。这不只是让表格更紧凑：8 列各让出 8px 就是 64px，
+   正好是 1280 宽下把横向滚动条挤出去所需的余量。Element Plus 自己的
+   .el-table .cell 是 0 12px，这里按优先级盖掉它。 */
+.table :deep(.cell) {
+  padding: 0 8px;
+}
+
 /* 表格行可点击进入详情，给出指针反馈 */
 .table :deep(.el-table__row) {
   cursor: pointer;
@@ -803,7 +821,8 @@ async function undoMove(docId: string, name: string, categoryId: number | null) 
   justify-content: center;
   width: 20px;
   height: 20px;
-  margin-left: -4px;
+  /* 原来这里有个 -4px（抵消 12px 内边距），内边距降到 8 之后
+     它会把图标顶出内容区，而 .cell 是 overflow:hidden，会被裁掉左边一条 */
   border-radius: 4px;
   color: var(--el-text-color-placeholder);
   cursor: grab;

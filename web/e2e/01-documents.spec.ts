@@ -299,3 +299,79 @@ test('回收站：行内只剩恢复与彻底删除，彻底删除要先过确�
   await expect(rowOf(page, name)).toHaveCount(0)
   await expect(page.getByText('回收站是空的')).toBeVisible()
 })
+
+/**
+ * 超过上限的文件，用户看到的是前端预检的拦下，不是服务端的 413。
+ *
+ * 上限由 /config 下发、前后端共用一份，所以界面上的超限在到达服务端之前就被拦住了 ——
+ * 服务端那次 413 在浏览器里按设计不可达，它由 scripts/acceptance_api.py 第 12 节
+ * 直接打接口覆盖（那里刻意绕过前端，才验证得到「后端自己也会拒」）。
+ * 这条用例管的是另一半：**用户看到的那句话对不对**，
+ * 上限是从服务端读的、还是前端自己写死的一个数字。
+ *
+ * 上限实测取值，不写死 20 MiB：换了 .env 里的 MAX_UPLOAD_BYTES，这条要跟着走。
+ */
+test('超过上传上限的文件在提交前被拦下，并说明上限是多少', async ({ page }) => {
+  const res = await page.request.get('/api/v1/config')
+  const { maxUploadBytes } = (await res.json()) as { maxUploadBytes: number }
+
+  const name = '超大件.txt'
+  await page.goto('/documents')
+  await page.getByRole('button', { name: '上传文件' }).click()
+  const dialog = page.locator('.el-dialog')
+
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name,
+    mimeType: 'text/plain',
+    buffer: Buffer.alloc(maxUploadBytes + 1, 'a'),
+  })
+
+  await expect(dialog.locator('.batch-item.is-invalid')).toContainText('超过上传上限')
+  // 预检不过就不该发请求，队列里没有可提交的行，按钮必须是灰的
+  await expect(dialog.getByRole('button', { name: '开始上传' })).toBeDisabled()
+  await dialog.getByRole('button', { name: '取消' }).click()
+  await expect(rowOf(page, name)).toHaveCount(0)
+})
+
+/**
+ * 服务端拒绝的上传要能原地重试，而不是让用户重选一遍文件。
+ *
+ * 得找一个「客户端预检拦不住、服务端会拒」的入口，否则这条用例压根走不到服务端：
+ * 体积与格式两边共用 /config，前端先拦下了。标签数量是前端唯一没做预检的一项
+ *（UploadDialog 的 validate 只管体积和扩展名），填 21 个就越过了服务端的 maxTagCount=20。
+ *
+ * 服务端的标签校验早于文件落盘（httpapi/documents.go），所以被拒时不会留下半个文件，
+ * 重试也不必先清理什么 —— 这正是一条「拒了再重试」的用例能写干净的前提。
+ */
+test('服务端拒绝的上传：理由原样可见、对话框不关，改好后重试能成功', async ({ page }) => {
+  const name = '标签超额.txt'
+  await page.goto('/documents')
+  await page.getByRole('button', { name: '上传文件' }).click()
+  const dialog = page.locator('.el-dialog')
+  const tagsInput = dialog.getByPlaceholder('用逗号分隔，例如：发布,复盘')
+
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name,
+    mimeType: 'text/plain',
+    buffer: Buffer.from('标签数量超限，用来验证服务端拒绝后的重试。\n'),
+  })
+  await tagsInput.fill(Array.from({ length: 21 }, (_, i) => `标记${i + 1}`).join(','))
+  await dialog.getByRole('button', { name: '开始上传' }).click()
+
+  // 失败的行要有失败的样式，理由用服务端给的那句、不另包一层话术
+  const failed = dialog.locator('.batch-item.is-failed')
+  await expect(failed).toContainText('标签数量不能超过 20 个')
+  // 有失败就不自动关闭，否则用户看不到是哪几个、为什么
+  await expect(dialog).toBeVisible()
+  await expect(rowOf(page, name)).toHaveCount(0)
+
+  await tagsInput.fill('发布,复盘')
+  // 文案要说清这是重试上一次，而不是又新开一轮上传
+  const retry = dialog.getByRole('button', { name: '重试 1 个失败项' })
+  await expect(retry).toBeVisible()
+  await retry.click()
+
+  await expect(page.getByText(`已上传「${name}」`)).toBeVisible()
+  await expect(dialog).toBeHidden()
+  await expect(rowOf(page, name)).toBeVisible()
+})
