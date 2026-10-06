@@ -127,25 +127,9 @@ func (s *Server) createDocument(c *gin.Context) {
 
 // GET /api/v1/documents
 func (s *Server) listDocuments(c *gin.Context) {
-	f := store.ListFilter{
-		Query:    strings.TrimSpace(c.Query("q")),
-		Archived: c.Query("archived") == "true",
-		Page:     atoiDefault(c.Query("page"), 1),
-		PageSize: atoiDefault(c.Query("pageSize"), 20),
-	}
-	if raw := strings.TrimSpace(c.Query("categoryId")); raw != "" {
-		// categoryId=none 表示「未分类」，这是树上的一类节点，
-		// 但它对应的是 category_id IS NULL，没法用分类标识表达
-		if raw == "none" {
-			f.OnlyUncategorized = true
-		} else {
-			id, err := strconv.ParseInt(raw, 10, 64)
-			if err != nil || id <= 0 {
-				fail(c, http.StatusBadRequest, codeBadRequest, "分类筛选参数无效")
-				return
-			}
-			f.CategoryID = &id
-		}
+	f, ok := parseListFilter(c)
+	if !ok {
+		return
 	}
 
 	items, total, err := s.store.ListDocuments(c.Request.Context(), f)
@@ -291,6 +275,33 @@ func (s *Server) updateDocument(c *gin.Context) {
 }
 
 // ---------------------------------------------------------------- 辅助函数
+
+// parseListFilter 解析列表与检索共用的筛选参数，失败时已写好 400 响应。
+func parseListFilter(c *gin.Context) (store.ListFilter, bool) {
+	f := store.ListFilter{
+		Query:    strings.TrimSpace(c.Query("q")),
+		Archived: c.Query("archived") == "true",
+		Page:     atoiDefault(c.Query("page"), 1),
+		PageSize: atoiDefault(c.Query("pageSize"), 20),
+	}
+	raw := strings.TrimSpace(c.Query("categoryId"))
+	if raw == "" {
+		return f, true
+	}
+	// categoryId=none 表示「未分类」，这是树上的一类节点，
+	// 但它对应的是 category_id IS NULL，没法用分类标识表达
+	if raw == "none" {
+		f.OnlyUncategorized = true
+		return f, true
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		fail(c, http.StatusBadRequest, codeBadRequest, "分类筛选参数无效")
+		return f, false
+	}
+	f.CategoryID = &id
+	return f, true
+}
 
 // loadDocument 读取路径参数指向的文档，失败时已写好响应。
 func (s *Server) loadDocument(c *gin.Context) (*store.Document, error) {

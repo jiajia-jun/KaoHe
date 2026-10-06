@@ -13,8 +13,11 @@ import (
 // ErrNotFound 表示目标记录不存在，由 HTTP 层翻译成 404。
 var ErrNotFound = errors.New("记录不存在")
 
+// Store 是全部数据访问的入口：文档与分类走 GORM，
+// 检索、分类树、索引任务队列走原生 SQL（见 docs/DESIGN.md 的关键取舍）。
 type Store struct{ db *gorm.DB }
 
+// New 用已有的连接池构造 Store。
 func New(db *gorm.DB) *Store { return &Store{db: db} }
 
 // Ping 检查数据库连通性，供健康接口使用。
@@ -30,6 +33,10 @@ func (s *Store) Ping(ctx context.Context) error {
 type ListFilter struct {
 	// Query 为空表示不按文件名过滤；非空时走 pg_trgm 索引的 ILIKE 匹配
 	Query string
+	// BodyMatches 为 true 时，Query 还要在正文片段里找一遍（关键词检索用）。
+	// 默认 false：列表页的搜索框只按文件名过滤，在那里翻正文会让
+	// 「搜文件名」的结果里混进一堆只是正文提到过它的文件。
+	BodyMatches bool
 	// CategoryID 指定分类时，会连同它的所有子分类一起纳入筛选。
 	// 树形筛选若只匹配一层，用户点父分类时会看到比子分类更少的结果，与直觉相反。
 	CategoryID *int64
@@ -40,6 +47,8 @@ type ListFilter struct {
 	Archived bool
 	Page     int
 	PageSize int
+	// SnippetsPerDoc 是每份文档最多取回的命中片段数，仅检索路径使用。
+	SnippetsPerDoc int
 }
 
 // where 拼出 WHERE 子句与对应的参数。
@@ -54,8 +63,17 @@ func (f ListFilter) where() (string, []any) {
 
 	b.WriteString(" WHERE d.archived = ?")
 	if f.Query != "" {
-		b.WriteString(" AND d.name ILIKE '%' || ? || '%'")
-		args = append(args, f.Query)
+		if f.BodyMatches {
+			// EXISTS 而不是 JOIN：一份文件正文里出现十次关键词，
+			// 在结果列表里也只该占一行
+			b.WriteString(` AND (d.name ILIKE '%' || ? || '%' OR EXISTS (
+        SELECT 1 FROM document_chunks ch
+        WHERE ch.document_id = d.id AND ch.content ILIKE '%' || ? || '%'))`)
+			args = append(args, f.Query, f.Query)
+		} else {
+			b.WriteString(" AND d.name ILIKE '%' || ? || '%'")
+			args = append(args, f.Query)
+		}
 	}
 	switch {
 	case f.CategoryID != nil:
@@ -114,6 +132,7 @@ FROM documents d
 LEFT JOIN categories c ON c.id = d.category_id
 WHERE d.doc_uid = ?`
 
+// GetDocument 按对外标识取文档，取不到时返回 ErrNotFound。
 func (s *Store) GetDocument(ctx context.Context, docUID string) (*Document, error) {
 	return s.scanDocument(ctx, getSelect, docUID)
 }

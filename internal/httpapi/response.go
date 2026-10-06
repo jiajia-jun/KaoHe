@@ -17,7 +17,11 @@ const (
 	codeUnsupported = "unsupported_type"
 	// codeConflict 表示请求本身合法，但与当前数据状态冲突（同级重名、分类还有子分类）。
 	// 与 bad_request 分开，界面才能把这类问题就地提示在输入框旁边。
-	codeConflict      = "conflict"
+	codeConflict = "conflict"
+	// codeUnavailable 表示某项依赖暂时不可用（如向量边车未就绪）。
+	// 与 internal_error 分开：这不是缺陷，而是「稍后重试可能就好了」，
+	// 界面该把它提示成暂时的，而不是让我们看起来像坏了。
+	codeUnavailable   = "service_unavailable"
 	codeInternalError = "internal_error"
 )
 

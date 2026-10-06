@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,13 +16,29 @@ import (
 const embedBatch = 16
 
 // Embedder 是向量边车的客户端。
+//
+// api 与 worker 共用一个 Embedder 实例：worker 用它给片段建索引，
+// api 的语义检索接口用它把用户的提问转成查询向量。
 type Embedder struct {
 	baseURL string
 	client  *http.Client
-	// Dimension 由边车自报，用于校验返回值与数据库里 vector(512) 的定义是否一致。
-	Dimension int
+	// dimension 由边车自报，用于校验返回值与数据库里 vector(512) 的定义是否一致。
+	//
+	// 用原子量而不是普通 int：api 的多个请求处理器会并发调用 Embed
+	// （每个语义检索请求都要转一次查询向量），而这个字段是在首次响应时才写入的。
+	// 普通 int 在这里就是一次数据竞争 —— 平时看不出症状，跑 -race 立刻报。
+	dimension atomic.Int64
 }
 
+// Dimension 返回边车自报的向量维度；还没和边车成功通信过时返回 0。
+func (e *Embedder) Dimension() int { return int(e.dimension.Load()) }
+
+// setDimension 记住边车自报的维度。首次写入之后，后续响应的维度都要与它一致。
+func (e *Embedder) setDimension(d int) { e.dimension.Store(int64(d)) }
+
+// NewEmbedder 构造边车客户端。维度初始未知：worker 会在 Run 开始时用
+// Health 把它问出来，api 则等到第一次语义检索时从响应里学到。
+// 未知期间不做维度校验，拿到之后才开始校验。
 func NewEmbedder(baseURL string) *Embedder {
 	return &Embedder{
 		baseURL: baseURL,
@@ -113,15 +130,15 @@ func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, erro
 	}
 	// 维度对不上就必须失败：写进 vector(512) 的列会被数据库拒绝，
 	// 在那里报错远不如在这里说清楚是模型换了。
-	if e.Dimension != 0 && parsed.Dimension != e.Dimension {
-		return nil, fmt.Errorf("向量维度不符：期望 %d，实际 %d", e.Dimension, parsed.Dimension)
+	if known := e.Dimension(); known != 0 && parsed.Dimension != known {
+		return nil, fmt.Errorf("向量维度不符：期望 %d，实际 %d", known, parsed.Dimension)
 	}
 	for i, v := range parsed.Vectors {
 		if len(v) != parsed.Dimension {
 			return nil, fmt.Errorf("第 %d 条向量维度为 %d，与声明的 %d 不符", i+1, len(v), parsed.Dimension)
 		}
 	}
-	e.Dimension = parsed.Dimension
+	e.setDimension(parsed.Dimension)
 	return parsed.Vectors, nil
 }
 

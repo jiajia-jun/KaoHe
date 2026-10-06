@@ -21,6 +21,7 @@ const activeMenu = computed(() => String(route.name ?? 'documents'))
       </div>
       <el-menu :default-active="activeMenu" mode="horizontal" class="app-nav" router :ellipsis="false">
         <el-menu-item index="documents" :route="{ name: 'documents' }">文件管理</el-menu-item>
+        <el-menu-item index="search" :route="{ name: 'search' }">知识检索</el-menu-item>
         <el-menu-item index="status" :route="{ name: 'status' }">系统状态</el-menu-item>
       </el-menu>
     </el-header>

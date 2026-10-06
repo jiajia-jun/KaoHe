@@ -10,20 +10,28 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"KaoHe/internal/config"
+	"KaoHe/internal/indexer"
 	"KaoHe/internal/storage"
 	"KaoHe/internal/store"
 )
 
+// Server 持有各处理器需要的依赖。
+// 处理器都是它的方法，因此取依赖不需要全局变量，测试时也便于替换。
 type Server struct {
 	cfg     *config.Config
 	store   *store.Store
 	storage *storage.Store
+	// embed 只用于语义检索：把用户的自然语言描述转成查询向量。
+	// 边车不可用时它返回错误，API 本身照常提供文件管理与关键词检索。
+	embed *indexer.Embedder
 }
 
-func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store) *gin.Engine {
+// NewRouter 装配全部路由。所有接口都挂在 /api/v1 下，
+// 只有 /healthz 例外 —— 容器的 healthcheck 直接打 api，不经过 nginx。
+func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store, embed *indexer.Embedder) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
-	s := &Server{cfg: cfg, store: st, storage: files}
+	s := &Server{cfg: cfg, store: st, storage: files, embed: embed}
 
 	r := gin.New()
 	r.Use(gin.Recovery(), accessLog())
@@ -43,6 +51,9 @@ func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store) *gin.E
 		api.GET("/documents/:id/download", s.downloadDocument)
 		api.PATCH("/documents/:id", s.updateDocument)
 		api.POST("/documents/:id/reindex", s.reindexDocument)
+
+		api.GET("/search", s.searchDocuments)
+		api.POST("/search/semantic", s.searchSemantic)
 
 		api.GET("/categories", s.listCategories)
 		api.POST("/categories", s.createCategory)

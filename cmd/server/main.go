@@ -105,9 +105,14 @@ func runAPI(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
+	// 边车这里不探活：文件管理、关键词检索都不依赖它，
+	// 为了一个可选能力把整个 API 拦在启动之外不划算。
+	// 语义检索会在真正调用失败时返回「服务暂不可用」。
+	embed := indexer.NewEmbedder(cfg.EmbedURL)
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           httpapi.NewRouter(cfg, store.New(gdb), files),
+		Handler:           httpapi.NewRouter(cfg, store.New(gdb), files, embed),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -124,7 +129,10 @@ func runAPI(ctx context.Context, cfg *config.Config) error {
 		return err
 	case <-ctx.Done():
 		slog.Info("收到退出信号，正在关闭 api")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// 这里必须从 context.Background() 起新的超时，不能挂在上面那个 ctx 上：
+		// 走到这一支时 ctx 已经被取消，用它派生的 ctx 一出生就是 done，
+		// Shutdown 会立刻返回而根本没等在途请求处理完 —— 优雅关闭就成了空话。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second) //nolint:contextcheck // 见上：此处必须脱离已取消的 ctx
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}

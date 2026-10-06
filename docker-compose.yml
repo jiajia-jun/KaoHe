@@ -68,6 +68,13 @@ services:
       LISTEN_ADDR: ":8080"
       UPLOAD_DIR: /data/uploads
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-20971520}"
+      SEMANTIC_MIN_SCORE: "${SEMANTIC_MIN_SCORE:-0.5}"
+      # 语义检索要把用户的描述转成查询向量。
+      #
+      # 这里刻意不依赖 embed 健康：文件管理与关键词检索都不需要它，
+      # 用 depends_on 把 api 拦住，等于让一个可选能力决定整个平台能不能起来。
+      # 边车没就绪时 api 照常提供其余功能，只有语义检索返回「服务暂不可用」。
+      EMBED_URL: http://embed:8000
     volumes:
       - uploads:/data/uploads
     depends_on:

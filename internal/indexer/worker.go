@@ -22,13 +22,16 @@ const (
 	recoverInterval = 30 * time.Second
 )
 
+// Worker 是索引任务的消费者，是唯一会改动 document_chunks 的角色。
+// api 只负责建任务，不碰向量，两边职责不重叠。
 type Worker struct {
-	store   *store.Store
-	files   *storage.Store
-	embed   *Embedder
+	store       *store.Store
+	files       *storage.Store
+	embed       *Embedder
 	lastRecover time.Time
 }
 
+// NewWorker 组装一个消费者，但不做任何 IO；连接与探活发生在 Run 里。
 func NewWorker(st *store.Store, files *storage.Store, embed *Embedder) *Worker {
 	return &Worker{store: st, files: files, embed: embed}
 }
@@ -41,7 +44,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.embed.Dimension = dim
+	w.embed.setDimension(dim)
 	slog.Info("worker 已启动", "embedDimension", dim, "poll", pollInterval.String())
 
 	ticker := time.NewTicker(pollInterval)
@@ -66,8 +69,11 @@ func (w *Worker) Run(ctx context.Context) error {
 // 一次 tick 处理多个任务，积压时不必每个都等一个 pollInterval。
 func (w *Worker) drain(ctx context.Context) error {
 	for {
+		// 这里返回 nil 是刻意的：ctx 被取消意味着容器在正常退出，
+		// 不是这一轮出了故障，报成错误会让 Run 把一次正常的 SIGTERM
+		// 记成一条失败日志。返回 nil 之后外层 select 会立刻命中 ctx.Done() 并收尾。
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // 见上：取消不是失败
 		}
 		job, err := w.store.ClaimIndexJob(ctx)
 		if err != nil {
