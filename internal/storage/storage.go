@@ -17,16 +17,22 @@ import (
 	"strings"
 )
 
+// Store 是持久化目录的唯一入口。
+//
+// 目录由宿主机的具名卷挂载进来，权限收在 0o750：
+// 容器内与宿主机的属主都是同一个用户，不需要给别人读的权限，
+// 而里面的东西是用户上传的原始文件，能少给一分就少给一分。
 type Store struct {
 	root string
 }
 
+// New 打开（必要时创建）存储根目录。
 func New(root string) (*Store, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("解析存储根目录失败: %w", err)
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
+	if err := os.MkdirAll(abs, 0o750); err != nil {
 		return nil, fmt.Errorf("创建存储根目录 %s 失败: %w", abs, err)
 	}
 	return &Store{root: abs}, nil
@@ -44,7 +50,7 @@ func (s *Store) Save(docUID, ext string, r io.Reader) (storageKey string, size i
 	if err != nil {
 		return "", 0, err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", 0, fmt.Errorf("创建文档目录失败: %w", err)
 	}
 
@@ -54,10 +60,14 @@ func (s *Store) Save(docUID, ext string, r io.Reader) (storageKey string, size i
 	}
 	tmpName := tmp.Name()
 
-	// 任何失败路径都要清理临时文件，避免在持久化目录里堆积垃圾
+	// 任何失败路径都要清理临时文件，避免在持久化目录里堆积垃圾。
+	//
+	// 这里的两个错误故意丢掉：走这条路时已经有一个更要紧的错误要往外报，
+	// 清理本身失败（文件已被删、句柄已失效）不改变任何结论，也不该把
+	// 真正的失败原因盖掉。清理只在临时文件上做，碰不到已落盘的数据。
 	cleanup := func() {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 	}
 
 	size, err = io.Copy(tmp, r)
@@ -70,14 +80,17 @@ func (s *Store) Save(docUID, ext string, r io.Reader) (storageKey string, size i
 		cleanup()
 		return "", 0, fmt.Errorf("刷新文件到磁盘失败: %w", err)
 	}
+	// 这一次 Close 必须判错，与上面 cleanup 里的那次不同：
+	// 它是写入路径上的最后一次握手，报错意味着可能还有内容没落盘。
+	// 忽略它就会得到一个「返回成功、文件却不完整」的结果。
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return "", 0, fmt.Errorf("关闭临时文件失败: %w", err)
 	}
 
 	storageKey = path.Join(docUID, "original"+ext)
 	if err := os.Rename(tmpName, filepath.Join(s.root, filepath.FromSlash(storageKey))); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return "", 0, fmt.Errorf("落盘失败: %w", err)
 	}
 	return storageKey, size, nil
@@ -89,13 +102,15 @@ func (s *Store) Open(storageKey string) (*os.File, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	f, err := os.Open(full)
+	// full 由 resolve 从存储根目录拼出，且已在里面校验过越界；
+	// 这里不会打开存储目录之外的路径。
+	f, err := os.Open(full) //nolint:gosec // G304：full 已经过 resolve 的越界校验
 	if err != nil {
 		return nil, nil, err
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, nil, err
 	}
 	return f, info, nil
@@ -145,15 +160,21 @@ func (s *Store) resolve(storageKey string) (string, error) {
 	return full, nil
 }
 
+// validateUID 只接受 newDocUID 生成的那几种字符。
+//
+// 写成允许清单而不是禁止清单：目录名会拼进文件路径，禁止清单只要漏掉一个字符
+// （尤其是 . 与路径分隔符）就是一个越界写入。允许清单默认拒绝一切没列出的东西。
 func validateUID(uid string) error {
 	if uid == "" || len(uid) > 64 {
 		return fmt.Errorf("非法文档标识: %q", uid)
 	}
 	for _, r := range uid {
-		if !(r == '_' || r == '-' ||
-			(r >= '0' && r <= '9') ||
-			(r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z')) {
+		switch {
+		case r == '_' || r == '-':
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		default:
 			return fmt.Errorf("非法文档标识: %q", uid)
 		}
 	}

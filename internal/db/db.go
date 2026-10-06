@@ -15,6 +15,8 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// Open 建立连接池。它只负责连上，不负责建表 ——
+// 表结构一律由 migrate 用迁移文件建，不用 AutoMigrate（见包注释）。
 func Open(dsn string) (*gorm.DB, error) {
 	gdb, err := gorm.Open(postgres.New(postgres.Config{DSN: dsn}), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),

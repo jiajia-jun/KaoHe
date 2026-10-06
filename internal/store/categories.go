@@ -79,6 +79,10 @@ type categoryRow struct {
 	DocumentCount int64  `gorm:"column:document_count"`
 }
 
+// ListCategoryTree 一次取回整棵树（含每层的文件计数），由调用方按 parentId 组装。
+//
+// 用递归 CTE 在数据库里算深度与计数，而不是取回全部行再在 Go 里数：
+// 界面每次进文件页都要这棵树，让数据库一趟算完比每层都发一次查询更稳。
 func (s *Store) ListCategoryTree(ctx context.Context) ([]*CategoryNode, error) {
 	var rows []categoryRow
 	if err := s.db.WithContext(ctx).Raw(categoryTreeSelect).Scan(&rows).Error; err != nil {
@@ -182,6 +186,8 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// CreateCategory 新建一个分类。parentID 为 nil 表示建在顶层。
+// 同级重名由数据库的唯一约束拦下，翻译成可读的错误而不是 500。
 func (s *Store) CreateCategory(ctx context.Context, parentID *int64, rawName string) (*CategoryNode, error) {
 	name, err := validateCategoryName(rawName)
 	if err != nil {
@@ -220,6 +226,8 @@ type CategoryUpdate struct {
 	MoveToSet bool
 }
 
+// UpdateCategory 改名或改层级。移动到自己的子树下会被拒绝 ——
+// 那会在树上形成环，之后谁也走不出那一段。
 func (s *Store) UpdateCategory(ctx context.Context, id int64, upd CategoryUpdate) (*CategoryNode, error) {
 	if err := s.ensureCategoryExists(ctx, id); err != nil {
 		return nil, err

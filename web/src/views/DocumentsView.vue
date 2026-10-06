@@ -47,6 +47,7 @@ const categoriesLoading = ref(false)
 const categoriesError = ref('')
 
 const config = ref<ServerConfig | null>(null)
+const configError = ref('')
 const uploadOpen = ref(false)
 const drawerOpen = ref(false)
 const activeId = ref<string | null>(null)
@@ -130,14 +131,26 @@ function watchIndexProgress() {
   indexTimer = window.setTimeout(() => void load(true), 1500)
 }
 
-onMounted(async () => {
-  // 上传限制取不到不影响浏览文件，失败时只是上传按钮暂不可用
+/**
+ * 取服务端的上传限制。
+ *
+ * 取不到不影响浏览、检索、下载，所以不让它连累整页；
+ * 但上传按钮会一直不可用，因此必须把「正在取」和「取失败了」分开记 ——
+ * 一直显示「正在获取…」会把一次已经失败的请求伪装成还在进行。
+ */
+async function loadConfig() {
+  configError.value = ''
   try {
     config.value = await fetchConfig()
-  } catch {
+  } catch (err) {
     config.value = null
+    configError.value = errorText(err)
   }
-  await Promise.all([loadCategories(), load()])
+}
+
+onMounted(() => {
+  void loadConfig()
+  void Promise.all([loadCategories(), load()])
 })
 
 onUnmounted(stopIndexWatch)
@@ -246,11 +259,15 @@ const selectedCategoryId = computed(() =>
             </el-input>
             <div class="toolbar-right">
               <el-button :disabled="phase === 'loading'" @click="load">刷新</el-button>
-              <el-tooltip content="正在获取服务端上传限制" placement="bottom" :disabled="!!config">
+              <!-- 上传限制拿不到就先不给点：对话框里的体积与格式校验都以它为准，
+                   放进去也只会得到一个「正在获取…，请稍候重试」的空壳 -->
+              <el-tooltip :content="configError ? `拿不到上传限制：${configError}` : '正在获取服务端上传限制'"
+                placement="bottom" :disabled="!!config">
                 <span>
                   <el-button type="primary" :disabled="!config" @click="uploadOpen = true">上传文件</el-button>
                 </span>
               </el-tooltip>
+              <el-button v-if="configError" text type="primary" @click="loadConfig">重试</el-button>
             </div>
           </div>
         </template>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { fetchHealth, type HealthResponse } from '@/api/client'
+import { errorText, fetchHealth, type HealthResponse } from '@/api/client'
 
 /**
  * M1 的验收页：它同时穿过三层 —— 浏览器 → nginx → api → PostgreSQL。
@@ -23,7 +23,10 @@ async function load() {
     phase.value = 'ok'
   } catch (err) {
     phase.value = 'error'
-    errorMessage.value = err instanceof Error ? err.message : String(err)
+    // 必须走 errorText：请求失败被收敛成的是 ApiError 这个普通对象，
+    // 它不是 Error 的实例，用 instanceof 判断会一路落到 String(err)，
+    // 界面上就只剩一句 [object Object]
+    errorMessage.value = errorText(err)
   }
 }
 

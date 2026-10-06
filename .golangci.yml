@@ -1,0 +1,47 @@
+# golangci-lint 配置。版本要求 v2（配置的 version 字段是 v2 的格式）。
+#
+# 用法：
+#   golangci-lint run ./...
+#
+# 默认集合（standard = errcheck / govet / ineffassign / staticcheck / unused）之外，
+# 这里只补了这一套服务真正会踩到的检查，不追求把能开的都开满 ——
+# 规则开太多之后，真正的告警会淹没在风格噪音里。
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    # 下面三条盯的都是「慢性泄漏」：跑一次看不出问题，跑一周才显形。
+    - bodyclose # 出网的响应体没关
+    - rowserrcheck # 遍历 rows 之后忘了查 rows.Err()
+    - sqlclosecheck # 忘了关 rows / stmt
+    - errorlint # 用 errors.Is / errors.As，而不是 == 直接比错误
+    - nilerr # err != nil 却 return nil，多半是漏了分支
+    - noctx # 出网请求没带 context，取消不掉、也没超时
+    - unparam # 参数或返回值永远是同一个值
+    - gosec # 文件权限、路径拼接一类的安全隐患
+    - revive # 导出符号的注释、命名与错误分支写法
+
+  settings:
+    errcheck:
+      # 只放过「收尾型」的 Close：defer 关闭只读文件、HTTP 响应体、数据库连接池与
+      # 迁移用的连接/游标。这类调用的错误改变不了任何结论 —— 真正的失败信号在
+      # Open / Read / Write 上，到 Close 时已经既成事实，报出来也无处可退。
+      # 强行逐个判错只会得到一堆 `defer func() { _ = f.Close() }()`，读起来更费劲。
+      #
+      # 写入路径上的 Close 不在豁免之列，它必须判错：storage.Save 里那次
+      # tmp.Close() 是显式判的，因为漏掉它就等于允许「返回成功、文件却不完整」。
+      # 如果哪天那处判错被删掉，这条豁免会让 linter 也保持沉默 —— 修改时请留意。
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*net/http.Response).Body.Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Conn).Close
+        - (*database/sql.Rows).Close
+
+  exclusions:
+    rules:
+      # 测试里的清理动作（关文件、删临时目录）失败不影响断言结果
+      - path: _test\.go
+        linters: [errcheck]

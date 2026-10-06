@@ -15,6 +15,7 @@ const (
 	KindText = "text"
 )
 
+// Info 描述一种受支持格式的两项属性。
 type Info struct {
 	// ContentType 是下载与预览时回给浏览器的类型
 	ContentType string

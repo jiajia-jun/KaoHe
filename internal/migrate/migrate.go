@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )`
 
+// Run 依次执行尚未应用的迁移文件，返回时数据库结构已是最新。
+//
+// 全程持有一把 advisory lock，因此多个 migrate 容器同时启动也只会有一个真正干活，
+// 其余的等它做完再发现无迁移可做。compose 里 api 依赖它成功退出，所以不用轮询。
 func Run(ctx context.Context, dsn string) error {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {

@@ -29,6 +29,8 @@ const (
 	JobFailed  = "failed"
 )
 
+// Category 是分类树上的一个节点。父子关系只靠 ParentID，
+// 没有物化路径列：树最多两层，递归 CTE 足够快，多维护一列反而多一处会写错的地方。
 type Category struct {
 	ID        int64     `gorm:"primaryKey" json:"-"`
 	ParentID  *int64    `gorm:"column:parent_id" json:"parentId"`
@@ -38,6 +40,10 @@ type Category struct {
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"updatedAt"`
 }
 
+// Document 是一份上传的文件。
+//
+// 注意「文件在不在」与「索引到哪一步了」是两个独立字段：
+// 归档只是把 Archived 置位、字节不动，索引失败也不会动原文件。
 type Document struct {
 	ID int64 `gorm:"primaryKey" json:"-"`
 	// DocUID 是对外标识，接口路径里用它，不暴露自增主键
@@ -64,8 +70,11 @@ type Document struct {
 	CategoryName *string `gorm:"->;column:category_name" json:"categoryName"`
 }
 
+// TableName 固定表名，不让 GORM 按结构体名推断。
 func (Document) TableName() string { return "documents" }
 
+// DocumentChunk 是文档切出的一段正文及其向量，关键词检索与语义检索共用这一份。
+// 重建索引时整篇的片段会被一起替换，不做增量合并。
 type DocumentChunk struct {
 	ID         int64   `gorm:"primaryKey"`
 	DocumentID int64   `gorm:"column:document_id"`
@@ -75,8 +84,12 @@ type DocumentChunk struct {
 	Embedding  *string `gorm:"column:embedding"` // 由原生 SQL 读写，GORM 不直接映射 vector
 }
 
+// TableName 固定表名，不让 GORM 按结构体名推断。
 func (DocumentChunk) TableName() string { return "document_chunks" }
 
+// IndexJob 是索引任务队列里的一行。
+// 队列就是这个表本身，没有额外的消息中间件；worker 用 FOR UPDATE SKIP LOCKED 领取。
+// 同一文档同时只允许一条未完成的任务，由部分唯一索引在数据库层保证。
 type IndexJob struct {
 	ID          int64     `gorm:"primaryKey"`
 	DocumentID  int64     `gorm:"column:document_id"`
@@ -89,4 +102,5 @@ type IndexJob struct {
 	UpdatedAt   time.Time `gorm:"column:updated_at"`
 }
 
+// TableName 固定表名，不让 GORM 按结构体名推断。
 func (IndexJob) TableName() string { return "index_jobs" }
