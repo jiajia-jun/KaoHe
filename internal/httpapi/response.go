@@ -11,10 +11,13 @@ import (
 
 // 错误码常量。前端据此区分处理方式，不必解析中文文案。
 const (
-	codeBadRequest    = "bad_request"
-	codeNotFound      = "not_found"
-	codeTooLarge      = "file_too_large"
-	codeUnsupported   = "unsupported_type"
+	codeBadRequest  = "bad_request"
+	codeNotFound    = "not_found"
+	codeTooLarge    = "file_too_large"
+	codeUnsupported = "unsupported_type"
+	// codeConflict 表示请求本身合法，但与当前数据状态冲突（同级重名、分类还有子分类）。
+	// 与 bad_request 分开，界面才能把这类问题就地提示在输入框旁边。
+	codeConflict      = "conflict"
 	codeInternalError = "internal_error"
 )
 

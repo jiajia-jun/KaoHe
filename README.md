@@ -29,7 +29,7 @@ docker compose up --build
 首次构建需要编译 Go、构建前端并拉取镜像，约需数分钟。待日志出现
 `api 已启动` 后，浏览器打开：
 
-**http://localhost:8080**
+<http://localhost:8080>
 
 若 8080 被占用，改 `.env` 里的 `WEB_PORT` 即可（容器内部不受影响）。
 
@@ -123,16 +123,21 @@ docker compose logs --tail=100 web
 
 ## 六、目录结构
 
-```
+```text
 .
 ├── cmd/server/            可执行入口，按 --mode 分角色
 ├── internal/
 │   ├── config/            环境变量读取
 │   ├── db/                数据库连接
+│   ├── storage/           上传文件落盘（临时文件 + rename 原子替换）
+│   ├── store/             数据访问：文档、分类、索引任务
 │   ├── httpapi/           HTTP 路由与处理器
 │   └── migrate/           迁移执行器（SQL 经 go:embed 编入二进制）
 │       └── sql/           迁移文件，按文件名顺序执行
+├── scripts/
+│   └── acceptance_api.py  接口层验收脚本
 ├── web/                   Vue 3 + Vite + TypeScript 前端
+│   └── e2e/               Playwright 端到端用例
 ├── testdata/corpus/       验收用测试文档（10 份）
 ├── docker-compose.yml
 └── Dockerfile
@@ -145,8 +150,8 @@ docker compose logs --tail=100 web
 | 里程碑 | 内容 | 状态 |
 | --- | --- | --- |
 | M1 | 部署骨架、健康检查、一键启动 | ✅ 已完成 |
-| M2 | 上传 / 下载 / 列表 / 详情 / 归档 / 恢复 | 进行中 |
-| M3 | 分类树、标签与筛选 | 计划中 |
+| M2 | 上传 / 下载 / 列表 / 详情 / 归档 / 恢复 | ✅ 已完成 |
+| M3 | 分类树、标签与筛选 | ✅ 已完成 |
 | M4 | 向量边车、切分与索引任务队列 | 计划中 |
 | M5 | 关键词检索与语义检索 | 计划中 |
 | M6 | 异常态与交互反馈打磨 | 计划中 |

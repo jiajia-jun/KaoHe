@@ -9,7 +9,9 @@ import { fileURLToPath } from 'node:url'
  * 不直接查数据库 —— 数据库里的数据正确但界面没渲染出来，对用户而言依然是坏的。
  *
  * 用例之间存在先后依赖（后一个接着前一个留下的数据），
- * 所以 playwright.config.ts 里把 workers 限制为 1。
+ * 所以 playwright.config.ts 里把 workers 限制为 1；
+ * 文件名带序号前缀，让「先跑哪个」由文件名决定，而不是靠字母序碰巧成立。
+ * 本文件从空库开始，因此必须排在 02-categories.spec.ts 之前。
  */
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const corpus = (name: string) => path.join(repoRoot, 'testdata', 'corpus', name)

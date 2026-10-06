@@ -12,6 +12,7 @@ import {
   updateDocument,
   type DocumentItem,
 } from '@/api/documents'
+import { flattenCategories, type CategoryNode } from '@/api/categories'
 import { formatBytes, formatDateTime, fileExtension } from '@/utils/format'
 import IndexStatusTag from '@/components/IndexStatusTag.vue'
 
@@ -21,7 +22,11 @@ import IndexStatusTag from '@/components/IndexStatusTag.vue'
  * 打开时按 id 重新拉一次详情，而不是直接用列表里的那条记录：
  * 列表可能是几分钟前取的，索引状态在此期间大概率已经变了。
  */
-const props = defineProps<{ modelValue: boolean; documentId: string | null }>()
+const props = defineProps<{
+  modelValue: boolean
+  documentId: string | null
+  categories: CategoryNode[]
+}>()
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
@@ -42,13 +47,23 @@ const busy = ref(false)
 const editing = ref(false)
 const nameDraft = ref('')
 const tagsDraft = ref('')
+const categoryDraft = ref<number | null>(null)
+
+// 用全角空格做缩进体现层级，与上传对话框里的分类下拉一致
+const categoryOptions = computed(() =>
+  flattenCategories(props.categories).map((item) => ({
+    value: item.id,
+    label: '　'.repeat(item.depth) + item.name,
+  })),
+)
 
 const isPdf = computed(() => doc.value?.contentType.startsWith('application/pdf') ?? false)
 const dirty = computed(
   () =>
     doc.value !== null &&
     (nameDraft.value.trim() !== doc.value.name ||
-      tagsDraft.value.trim() !== doc.value.tags.join(',')),
+      tagsDraft.value.trim() !== doc.value.tags.join(',') ||
+      categoryDraft.value !== doc.value.categoryId),
 )
 
 async function load() {
@@ -70,6 +85,7 @@ async function load() {
 function resetDraft(target: DocumentItem) {
   nameDraft.value = target.name
   tagsDraft.value = target.tags.join(',')
+  categoryDraft.value = target.categoryId
   editing.value = false
 }
 
@@ -116,8 +132,15 @@ async function save() {
     ElMessage.error('文件名不能为空')
     return
   }
+  // 分类显式传值（含 null）：这里表达的是「改成下拉里选的这个」，
+  // 选为空就是要把它移出所有分类，与「不改动」是两回事
   await run(
-    () => updateDocument(doc.value!.id, { name, tags: parseTags(tagsDraft.value) }),
+    () =>
+      updateDocument(doc.value!.id, {
+        name,
+        tags: parseTags(tagsDraft.value),
+        categoryId: categoryDraft.value,
+      }),
     '已保存',
   )
 }
@@ -176,7 +199,14 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
         </el-descriptions-item>
 
         <el-descriptions-item label="分类">
-          <span v-if="doc.categoryName">{{ doc.categoryName }}</span>
+          <template v-if="editing">
+            <el-select v-model="categoryDraft" placeholder="不选择则归为未分类" clearable filterable
+              class="category-select">
+              <el-option v-for="option in categoryOptions" :key="option.value" :label="option.label"
+                :value="option.value" />
+            </el-select>
+          </template>
+          <span v-else-if="doc.categoryName">{{ doc.categoryName }}</span>
           <span v-else class="doc-empty">未分类</span>
         </el-descriptions-item>
 
@@ -231,6 +261,10 @@ async function withBlob(use: (blob: Blob) => void, failText: string) {
 
 .doc-empty {
   color: var(--el-text-color-secondary);
+}
+
+.category-select {
+  width: 100%;
 }
 
 .doc-index-error {

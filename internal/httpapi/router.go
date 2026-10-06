@@ -42,6 +42,11 @@ func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store) *gin.E
 		api.GET("/documents/:id", s.getDocument)
 		api.GET("/documents/:id/download", s.downloadDocument)
 		api.PATCH("/documents/:id", s.updateDocument)
+
+		api.GET("/categories", s.listCategories)
+		api.POST("/categories", s.createCategory)
+		api.PATCH("/categories/:id", s.updateCategory)
+		api.DELETE("/categories/:id", s.deleteCategory)
 	}
 
 	return r

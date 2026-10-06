@@ -29,7 +29,8 @@ export default function globalSetup() {
     '-d',
     'kaohe',
     '-c',
-    'TRUNCATE documents, index_jobs, document_chunks RESTART IDENTITY CASCADE;',
+    // categories 一起清：documents 引用它，单独清 documents 会把它留下
+    'TRUNCATE documents, index_jobs, document_chunks, categories RESTART IDENTITY CASCADE;',
   ])
   // 数据库清空了，磁盘上的原文件也必须一起清掉，
   // 否则残留文件不会影响断言，却会掩盖“删除是否真的落盘”这类问题

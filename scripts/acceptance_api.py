@@ -130,7 +130,9 @@ def sql(query: str) -> str:
 
 
 def reset() -> None:
-    sql("TRUNCATE documents, index_jobs, document_chunks RESTART IDENTITY CASCADE;")
+    # categories 必须一起清：documents 引用它，单独清 documents 会把它留下，
+    # 后面的分类用例就会带着上一轮的残留数据开始
+    sql("TRUNCATE documents, index_jobs, document_chunks, categories RESTART IDENTITY CASCADE;")
     subprocess.run(
         ["docker", "compose", "exec", "-T", "api", "sh", "-c", "rm -rf /data/uploads/*"],
         capture_output=True,
@@ -275,6 +277,98 @@ def main() -> int:
     chk("错误码", err["code"], "file_too_large")
     chk("提示含上限数值", "20" in err["message"], True)
     chk("未落库", sql("SELECT count(*) FROM documents"), "2")
+
+    print("== 13. 分类：创建与层级 ==")
+    status, root, _ = call("POST", "/categories", json_body={"name": "研发"})
+    chk("创建顶层分类 201", status, 201)
+    chk("名称", root["name"], "研发")
+    chk("父分类为空", root["parentId"], None)
+    root_id = root["id"]
+
+    status, child, _ = call("POST", "/categories", json_body={"name": "前端", "parentId": root_id})
+    chk("创建子分类 201", status, 201)
+    chk("挂在父分类下", child["parentId"], root_id)
+    chk("层级为 1", child["depth"], 1)
+    child_id = child["id"]
+
+    status, err, _ = call("POST", "/categories", json_body={"name": "研发"})
+    chk("同级重名 409", status, 409)
+    chk("错误码", err["code"], "conflict")
+    chk("空分类名 400", call("POST", "/categories", json_body={"name": "  "})[0], 400)
+    chk("分类名超长 400", call("POST", "/categories", json_body={"name": "x" * 41})[0], 400)
+    chk("父分类不存在 400", call("POST", "/categories", json_body={"name": "孤儿", "parentId": 999999})[0], 400)
+
+    status, tree, _ = call("GET", "/categories")
+    chk("分类树 200", status, 200)
+    chk("顶层只有 1 个", len(tree["items"]), 1)
+    chk("顶层含 1 个子分类", len(tree["items"][0]["children"]), 1)
+
+    print("== 14. 分类：文件归属与筛选 ==")
+    status, updated, _ = call("PATCH", f"/documents/{uid}", json_body={"categoryId": child_id})
+    chk("移动文件 200", status, 200)
+    chk("categoryId 已更新", updated["categoryId"], child_id)
+    chk("categoryName 一并返回", updated["categoryName"], "前端")
+
+    _, listing, _ = call("GET", f"/documents?categoryId={child_id}")
+    chk("按子分类筛选命中 1 条", listing["total"], 1)
+    _, listing, _ = call("GET", f"/documents?categoryId={root_id}")
+    chk("按父分类筛选能筛到子分类的文件", listing["total"], 1)
+
+    _, listing, _ = call("GET", "/documents?categoryId=none")
+    chk("未分类筛选只剩 PDF", listing["total"], 1)
+    chk("  且确实是那个 PDF", listing["items"][0]["id"], pdf_doc["id"])
+
+    print("== 15. 分类：改名与移动 ==")
+    status, renamed, _ = call("PATCH", f"/categories/{child_id}", json_body={"name": "移动端"})
+    chk("改名 200", status, 200)
+    chk("新名称", renamed["name"], "移动端")
+    _, doc_after, _ = call("GET", f"/documents/{uid}")
+    chk("文件显示的分类名同步更新", doc_after["categoryName"], "移动端")
+
+    status, err, _ = call("PATCH", f"/categories/{root_id}", json_body={"parentId": child_id})
+    chk("移到自己的子分类下 400", status, 400)
+    chk("错误码", err["code"], "bad_request")
+    chk("  提示说明了原因", "自己" in err["message"], True)
+
+    status, moved_root, _ = call("PATCH", f"/categories/{child_id}", json_body={"parentId": None})
+    chk("移到顶层 200", status, 200)
+    chk("父分类已清空", moved_root["parentId"], None)
+    chk("层级回到 0", moved_root["depth"], 0)
+
+    print("== 16. 分类：删除 ==")
+    chk("删除不存在的分类 404", call("DELETE", "/categories/999999")[0], 404)
+
+    # 用自己的父子结构来测删除，不复用第 13、15 节建的那两个：
+    # 第 15 节已经把「移动端」移到了顶层，再假设「研发」还有子分类就会测到别的东西上。
+    _, group, _ = call("POST", "/categories", json_body={"name": "归档组"})
+    group_id = group["id"]
+    _, subgroup, _ = call("POST", "/categories", json_body={"name": "归档子类", "parentId": group_id})
+    subgroup_id = subgroup["id"]
+
+    chk("删除仍有子分类的父分类 409", call("DELETE", f"/categories/{group_id}")[0], 409)
+    _, tree, _ = call("GET", "/categories")
+    chk("  被拒后父分类仍在", [n["name"] for n in tree["items"]].count("归档组"), 1)
+
+    _, moved, _ = call("PATCH", f"/documents/{uid}", json_body={"categoryId": subgroup_id})
+    chk("把文件移入该子分类", moved["categoryId"], subgroup_id)
+
+    status, result, _ = call("DELETE", f"/categories/{subgroup_id}")
+    chk("删除子分类 200", status, 200)
+    chk("移出分类的文件数为 1", result["movedDocuments"], 1)
+    _, doc_after, _ = call("GET", f"/documents/{uid}")
+    chk("文件仍在", doc_after["id"], uid)
+    chk("文件已变为未分类", doc_after["categoryId"], None)
+    chk("文件未归档", doc_after["archived"], False)
+    chk("原文件仍可下载", call("GET", f"/documents/{uid}/download")[0], 200)
+
+    chk("父分类此时已无子分类，可删除", call("DELETE", f"/categories/{group_id}")[0], 200)
+
+    # 收尾：把前面几节建的分类清干净，「移动端」下的文件已在上面移走，所以是 0
+    status, result, _ = call("DELETE", f"/categories/{child_id}")
+    chk("删除已无文件的分类 200", status, 200)
+    chk("  移出文件数为 0", result["movedDocuments"], 0)
+    chk("删除「研发」200", call("DELETE", f"/categories/{root_id}")[0], 200)
+    chk("分类树已空", len(call("GET", "/categories")[1]["items"]), 0)
 
     print(f"\n结果：PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0

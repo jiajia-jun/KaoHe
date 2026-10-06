@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import type { UploadFile, UploadInstance, UploadRawFile } from 'element-plus'
 import { errorText } from '@/api/client'
 import { uploadDocument, type DocumentItem, type ServerConfig } from '@/api/documents'
+import { flattenCategories, type CategoryNode } from '@/api/categories'
 import { formatBytes, fileExtension } from '@/utils/format'
 
 /**
@@ -15,8 +16,9 @@ import { formatBytes, fileExtension } from '@/utils/format'
 const props = defineProps<{
   modelValue: boolean
   config: ServerConfig | null
-  /** M3 接入分类树后由父组件传入当前选中的分类，作为新建文件的默认归属 */
-  categoryId?: number | null
+  categories: CategoryNode[]
+  /** 分类树上当前选中的分类，作为新上传文件的默认归属 */
+  categoryId: number | null
 }>()
 
 const emit = defineEmits<{
@@ -32,9 +34,18 @@ const visible = computed({
 const uploadRef = ref<UploadInstance>()
 const file = ref<File | null>(null)
 const tagsInput = ref('')
+const categoryChoice = ref<number | null>(null)
 const percent = ref(0)
 const uploading = ref(false)
 const problem = ref('')
+
+// 用全角空格做缩进，在下拉里体现层级：「研发 / 前端」与顶层「前端」需要能区分开
+const categoryOptions = computed(() =>
+  flattenCategories(props.categories).map((item) => ({
+    value: item.id,
+    label: '　'.repeat(item.depth) + item.name,
+  })),
+)
 
 const accept = computed(() => props.config?.allowedExtensions.join(',') ?? '')
 const limitText = computed(() =>
@@ -51,6 +62,8 @@ watch(visible, (open) => {
   if (!open) return
   file.value = null
   tagsInput.value = ''
+  // 默认落在树上当前选中的分类：用户点开某个分类再上传，多半就是想传到那里
+  categoryChoice.value = props.categoryId
   percent.value = 0
   problem.value = ''
   uploading.value = false
@@ -110,7 +123,7 @@ async function submit() {
   percent.value = 0
   try {
     const doc = await uploadDocument(file.value, {
-      categoryId: props.categoryId ?? null,
+      categoryId: categoryChoice.value,
       tags: parseTags(),
       onProgress: (value) => {
         percent.value = value
@@ -146,6 +159,13 @@ async function submit() {
     </el-upload>
 
     <el-form label-width="72px" class="upload-form">
+      <el-form-item label="分类">
+        <el-select v-model="categoryChoice" placeholder="不选择则归为未分类" clearable filterable
+          :disabled="uploading" class="category-select">
+          <el-option v-for="option in categoryOptions" :key="option.value" :label="option.label"
+            :value="option.value" />
+        </el-select>
+      </el-form-item>
       <el-form-item label="标签">
         <el-input v-model="tagsInput" placeholder="用逗号分隔，例如：发布,复盘" :disabled="uploading" clearable />
       </el-form-item>
@@ -187,6 +207,10 @@ async function submit() {
 
 .upload-form {
   margin-top: 16px;
+}
+
+.category-select {
+  width: 100%;
 }
 
 .upload-progress {

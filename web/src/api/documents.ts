@@ -41,7 +41,10 @@ export async function fetchConfig(): Promise<ServerConfig> {
 
 export interface DocumentListQuery {
   q?: string
+  /** 指定分类时后端会把该分类的整棵子树一并纳入筛选 */
   categoryId?: number | null
+  /** 只看没有归属分类的文件，对应分类树上的「未分类」 */
+  uncategorized?: boolean
   archived?: boolean
   page?: number
   pageSize?: number
@@ -58,7 +61,8 @@ export async function listDocuments(query: DocumentListQuery = {}): Promise<Docu
   const { data } = await http.get<DocumentListResult>('/documents', {
     params: {
       q: query.q || undefined,
-      categoryId: query.categoryId ?? undefined,
+      // 未分类对应 category_id IS NULL，没法用分类标识表达，后端约定为字面量 none
+      categoryId: query.uncategorized ? 'none' : (query.categoryId ?? undefined),
       archived: query.archived ? 'true' : undefined,
       page: query.page,
       pageSize: query.pageSize,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -29,34 +30,54 @@ func (s *Store) Ping(ctx context.Context) error {
 type ListFilter struct {
 	// Query 为空表示不按文件名过滤；非空时走 pg_trgm 索引的 ILIKE 匹配
 	Query string
-	// CategoryID 是精确分类筛选，nil 表示不筛选
+	// CategoryID 指定分类时，会连同它的所有子分类一起纳入筛选。
+	// 树形筛选若只匹配一层，用户点父分类时会看到比子分类更少的结果，与直觉相反。
 	CategoryID *int64
+	// OnlyUncategorized 为 true 时只看没有归属分类的文件（对应树上的「未分类」）。
+	// 与 CategoryID 互斥，CategoryID 优先。
+	OnlyUncategorized bool
 	// Archived 为 false 时只返回未归档文档，这是默认列表的语义
 	Archived bool
 	Page     int
 	PageSize int
 }
 
-const listSelect = `
-SELECT d.*, c.name AS category_name
-FROM documents d
-LEFT JOIN categories c ON c.id = d.category_id
-WHERE d.archived = ?
-  AND (? = '' OR d.name ILIKE '%' || ? || '%')
-  AND (?::bigint IS NULL OR d.category_id = ?)
-ORDER BY d.created_at DESC, d.id DESC
-LIMIT ? OFFSET ?`
+// where 拼出 WHERE 子句与对应的参数。
+//
+// 这里用字符串拼接而不是纯粹的参数化查询，是因为「是否按分类筛选」决定了
+// 要不要多出一段子查询，占位符的个数随条件变化，写成一串
+// `(? IS NULL OR ...)` 反而更难读、也更容易在新增条件时出错。
+// 拼进去的全是本文件里的常量，用户输入一律走占位符。
+func (f ListFilter) where() (string, []any) {
+	var b strings.Builder
+	args := []any{f.Archived}
 
-const countSelect = `
-SELECT count(*)
-FROM documents d
-WHERE d.archived = ?
-  AND (? = '' OR d.name ILIKE '%' || ? || '%')
-  AND (?::bigint IS NULL OR d.category_id = ?)`
+	b.WriteString(" WHERE d.archived = ?")
+	if f.Query != "" {
+		b.WriteString(" AND d.name ILIKE '%' || ? || '%'")
+		args = append(args, f.Query)
+	}
+	switch {
+	case f.CategoryID != nil:
+		// 递归取该分类的整棵子树，一次查询完成，不依赖应用层遍历
+		b.WriteString(` AND d.category_id IN (
+        WITH RECURSIVE subtree AS (
+            SELECT id FROM categories WHERE id = ?
+            UNION ALL
+            SELECT c.id FROM categories c JOIN subtree s ON c.parent_id = s.id
+        )
+        SELECT id FROM subtree)`)
+		args = append(args, *f.CategoryID)
+	case f.OnlyUncategorized:
+		b.WriteString(" AND d.category_id IS NULL")
+	}
+	return b.String(), args
+}
 
 // ListDocuments 返回一页文档与命中总数。
+//
 // 用原生 SQL 而非 GORM 链式调用：ILIKE 与 pg_trgm 索引的配合、
-// 以及可空的分类筛选，写成 SQL 比拼 GORM 条件更清楚也更可控。
+// 分类子树的递归查询，写成 SQL 比拼 GORM 条件更清楚也更可控。
 func (s *Store) ListDocuments(ctx context.Context, f ListFilter) ([]Document, int64, error) {
 	if f.Page < 1 {
 		f.Page = 1
@@ -66,19 +87,22 @@ func (s *Store) ListDocuments(ctx context.Context, f ListFilter) ([]Document, in
 	}
 	offset := (f.Page - 1) * f.PageSize
 
+	where, args := f.where()
+
 	var items []Document
-	err := s.db.WithContext(ctx).Raw(listSelect,
-		f.Archived, f.Query, f.Query, f.CategoryID, f.CategoryID, f.PageSize, offset,
-	).Scan(&items).Error
-	if err != nil {
+	listSQL := `SELECT d.*, c.name AS category_name
+FROM documents d
+LEFT JOIN categories c ON c.id = d.category_id` + where +
+		` ORDER BY d.created_at DESC, d.id DESC LIMIT ? OFFSET ?`
+	if err := s.db.WithContext(ctx).Raw(listSQL,
+		append(append([]any{}, args...), f.PageSize, offset)...,
+	).Scan(&items).Error; err != nil {
 		return nil, 0, fmt.Errorf("查询文档列表失败: %w", err)
 	}
 
 	var total int64
-	err = s.db.WithContext(ctx).Raw(countSelect,
-		f.Archived, f.Query, f.Query, f.CategoryID, f.CategoryID,
-	).Scan(&total).Error
-	if err != nil {
+	countSQL := `SELECT count(*) FROM documents d` + where
+	if err := s.db.WithContext(ctx).Raw(countSQL, args...).Scan(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("统计文档总数失败: %w", err)
 	}
 	return items, total, nil

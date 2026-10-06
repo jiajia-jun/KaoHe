@@ -146,12 +146,18 @@ func (s *Server) listDocuments(c *gin.Context) {
 		PageSize: atoiDefault(c.Query("pageSize"), 20),
 	}
 	if raw := strings.TrimSpace(c.Query("categoryId")); raw != "" {
-		id, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || id <= 0 {
-			fail(c, http.StatusBadRequest, codeBadRequest, "分类筛选参数无效")
-			return
+		// categoryId=none 表示「未分类」，这是树上的一类节点，
+		// 但它对应的是 category_id IS NULL，没法用分类标识表达
+		if raw == "none" {
+			f.OnlyUncategorized = true
+		} else {
+			id, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || id <= 0 {
+				fail(c, http.StatusBadRequest, codeBadRequest, "分类筛选参数无效")
+				return
+			}
+			f.CategoryID = &id
 		}
-		f.CategoryID = &id
 	}
 
 	items, total, err := s.store.ListDocuments(c.Request.Context(), f)

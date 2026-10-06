@@ -78,15 +78,15 @@ type DocumentChunk struct {
 func (DocumentChunk) TableName() string { return "document_chunks" }
 
 type IndexJob struct {
-	ID          int64      `gorm:"primaryKey"`
-	DocumentID  int64      `gorm:"column:document_id"`
-	Status      string     `gorm:"column:status"`
-	Attempts    int        `gorm:"column:attempts"`
-	MaxAttempts int        `gorm:"column:max_attempts"`
-	LastError   *string    `gorm:"column:last_error"`
-	RunAfter    time.Time  `gorm:"column:run_after"`
-	CreatedAt   time.Time  `gorm:"column:created_at"`
-	UpdatedAt   time.Time  `gorm:"column:updated_at"`
+	ID          int64     `gorm:"primaryKey"`
+	DocumentID  int64     `gorm:"column:document_id"`
+	Status      string    `gorm:"column:status"`
+	Attempts    int       `gorm:"column:attempts"`
+	MaxAttempts int       `gorm:"column:max_attempts"`
+	LastError   *string   `gorm:"column:last_error"`
+	RunAfter    time.Time `gorm:"column:run_after"`
+	CreatedAt   time.Time `gorm:"column:created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at"`
 }
 
 func (IndexJob) TableName() string { return "index_jobs" }
