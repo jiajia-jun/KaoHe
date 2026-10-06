@@ -10,15 +10,24 @@ import {
   fetchDocumentBlob,
   isIndexing,
   listDocuments,
+  moveDocument,
   purgeDocument,
   restoreDocument,
   restoreFromTrash,
   saveBlob,
+  updateDocument,
   type DocumentItem,
   type ServerConfig,
+  type UploadBatchResult,
 } from '@/api/documents'
-import { fetchCategoryTree, parseCategoryKey, type CategoryNode } from '@/api/categories'
+import {
+  fetchCategoryTree,
+  flattenCategories,
+  parseCategoryKey,
+  type CategoryNode,
+} from '@/api/categories'
 import { formatBytes, formatDateTime, fileExtension } from '@/utils/format'
+import { useDocumentDrag } from '@/composables/useDocumentDrag'
 import IndexStatusTag from '@/components/IndexStatusTag.vue'
 import UploadDialog from '@/components/UploadDialog.vue'
 import DocumentDrawer from '@/components/DocumentDrawer.vue'
@@ -212,13 +221,23 @@ function openDetail(row: DocumentItem) {
   drawerOpen.value = true
 }
 
-function onUploaded(doc: DocumentItem) {
-  ElMessage.success(`已上传「${doc.name}」`)
-  page.value = 1
-  // 新文件一定不在回收站或归档区里，上传完还停在那两个页面会让人以为没传上去
-  tab.value = 'active'
-  void load()
-  void loadCategories()
+function onUploaded(result: UploadBatchResult) {
+  const { succeeded, failed } = result
+  if (succeeded.length) {
+    // 单文件仍是「已上传「文件名」」；多于一个才换成计数，逐个念一遍反而看不清
+    const ok =
+      succeeded.length === 1 ? `已上传「${succeeded[0].name}」` : `已上传 ${succeeded.length} 个文件`
+    // 有失败的仍报成功数，但把失败条数一并说清 —— 失败明细在上传对话框里逐行留着
+    if (failed > 0) ElMessage.warning(`${ok}，${failed} 个失败`)
+    else ElMessage.success(ok)
+
+    page.value = 1
+    // 新文件一定不在回收站或归档区里，上传完还停在那两个页面会让人以为没传上去
+    tab.value = 'active'
+    void load()
+    void loadCategories()
+  }
+  // 整批都失败时不刷新，也不需要提示：对话框没关，失败原因就在用户眼前的每一行上
 }
 
 async function toggleArchive(row: DocumentItem) {
@@ -359,13 +378,185 @@ async function clearTrash() {
 const selectedCategoryId = computed(() =>
   selection.value.mode === 'category' ? selection.value.id : null,
 )
+
+/**
+ * 什么时候能拖。
+ *
+ * 回收站是暂存区，位置对它没有意义；搜索结果由相关性主导（打分排序在服务端，
+ * 拖动一个按分数排出来的列表，用户说不清自己想要什么）。这两种情况下一律不给拖，
+ * 而不是「拖了但顺序待会儿会被冲掉」—— 后者比干脆不能拖更让人困惑。
+ */
+const dragEnabled = computed(
+  () =>
+    (tab.value === 'active' || tab.value === 'archived') &&
+    search.value.trim() === '' &&
+    phase.value === 'ready',
+)
+
+/**
+ * 长按拖拽。落点有两种：两行之间改顺序，分类节点上改归属。
+ *
+ * 拖动期间必须停掉索引轮询 —— 一次静默刷新会在拖动中途换掉整个列表，
+ * 手里攥着的那一行就和屏幕上的对不上了。
+ */
+const {
+  isDragging,
+  draggingId,
+  ghost: dragGhost,
+  dropIndex,
+  dropCatKey,
+  onPointerDown: onTablePointerDown,
+} = useDocumentDrag({
+  available: () => dragEnabled.value,
+  // 拖到第一行之上的含义是全局置顶，只有第一页的「上面」才真的是最前
+  canDropAtTop: () => page.value === 1,
+  onStart: stopIndexWatch,
+  onEnd: watchIndexProgress,
+  onReorder: (docId, afterId) => void reorder(docId, afterId),
+  onDropCategory: (docId, categoryId) => void moveToCategory(docId, categoryId),
+})
+
+/** 跟手的文件条上显示的名字。从列表里现取，不让拖拽逻辑再抄一份行数据。 */
+const draggingName = computed(
+  () => items.value.find((item) => item.id === draggingId.value)?.name ?? '',
+)
+
+/**
+ * 插入线的落点样式。
+ *
+ * 写成普通函数而不是 computed：el-table 只在自身重渲染时调用它，而这里读的
+ * 是拖动过程中每次 pointermove 都在变的 ref —— 必须现读现算。用 computed
+ * 会把第一次算出来的值缓存住，线就画不动了。
+ */
+function rowClassName({ rowIndex }: { rowIndex: number }): string {
+  if (!isDragging.value) return ''
+  const target = dropIndex.value
+  if (target === null) return ''
+  // 落到最后一行之后：标记最后一行即可，不必为了画一条线在表尾塞个占位元素
+  if (target >= items.value.length) {
+    return rowIndex === items.value.length - 1 ? 'is-drop-after' : ''
+  }
+  return rowIndex === target ? 'is-drop-before' : ''
+}
+
+/**
+ * 把文件挪到另一份之后（afterId 为 null 即置顶）。
+ *
+ * 乐观更新：先把本地列表挪好，让手势的落点和眼前的结果立刻对上，再把请求发出去；
+ * 失败就重新取一次，回到服务端的真实顺序。
+ *
+ * 不弹成功提示，也不给撤销 —— 结果就在眼前，不满意拖回去即可。
+ * 这与「移入回收站」「移入分类」正好相反：那两步的数据离开了视野，
+ * 才需要一条带撤销入口的提示把它找回来（DESIGN.md §3.8：反馈强度按可逆性来定）。
+ */
+async function reorder(rowId: string, afterId: string | null) {
+  const from = items.value.findIndex((item) => item.id === rowId)
+  if (from < 0) return
+
+  const rest = items.value.filter((_, index) => index !== from)
+  let at = 0
+  if (afterId !== null) {
+    // 锚点不在本页时本地排不出来。服务端能处理，但屏幕上会先闪一个错的顺序，
+    // 不如什么都不做 —— 跨页拖动本来也不在支持范围内（见 DESIGN.md §5）。
+    const anchor = rest.findIndex((item) => item.id === afterId)
+    if (anchor < 0) return
+    at = anchor + 1
+  }
+
+  const next = [...rest.slice(0, at), items.value[from], ...rest.slice(at)]
+  // 顺序没变（拖回原位）就不发请求：服务端也会判定为「没有变化」，白等一趟
+  if (next.every((item, index) => item.id === items.value[index].id)) return
+
+  items.value = next
+  try {
+    await moveDocument(rowId, afterId)
+  } catch (err) {
+    ElMessage.error(`调整顺序失败：${errorText(err)}`)
+    // 服务端才是准的：拉回真实顺序，别把一个错的顺序留在屏幕上
+    void load(true)
+  }
+}
+
+/**
+ * 把文件拖到分类节点上。
+ *
+ * 直接移动、不弹确认：这一步与「移入回收站」同级，随时可以反悔，
+ * 所以按同一套做法给一条带撤销入口的提示就够了（DESIGN.md §3.8）。
+ */
+async function moveToCategory(docId: string, categoryId: number | null) {
+  const row = items.value.find((item) => item.id === docId)
+  if (!row) return
+  // 已经在这个分类里（含「本来就是未分类」）就什么都不做，也不发请求
+  if ((row.categoryId ?? null) === categoryId) return
+
+  const previous = row.categoryId ?? null
+  try {
+    await updateDocument(docId, { categoryId })
+    notifyMoved(row, categoryId, previous)
+    void load()
+    void loadCategories()
+  } catch (err) {
+    ElMessage.error(`移动分类失败：${errorText(err)}`)
+  }
+}
+
+/** 分类名：撤销时要能说清「移回哪里」，拿标识糊弄等于没提示。 */
+function categoryLabel(id: number | null): string {
+  if (id === null) return '未分类'
+  const name = flattenCategories(categories.value).find((item) => item.id === id)?.name
+  return name ? `「${name}」` : '原分类'
+}
+
+/**
+ * 移动分类后的提示，带一个就地撤销的入口。
+ *
+ * 时长与写法都跟「移入回收站」保持一致：同样是「数据离开了原来的位置」，
+ * 用户需要一条能立刻反悔的通路。而拖动排序不给撤销 —— 结果就在眼前，拖回去即可。
+ */
+function notifyMoved(row: DocumentItem, categoryId: number | null, previous: number | null) {
+  const instance = ElMessage({
+    type: 'success',
+    duration: 6000,
+    message: h('div', { style: 'display:flex;align-items:center;gap:12px' }, [
+      h('span', null, `已把「${row.name}」移入${categoryLabel(categoryId)}`),
+      h(
+        ElButton,
+        {
+          text: true,
+          type: 'primary',
+          size: 'small',
+          // 先关掉提示再发请求：撤销失败会另起一条错误提示，
+          // 两条消息叠在一起时，用户分不清哪条说的是当前状态
+          onClick: () => {
+            instance.close()
+            void undoMove(row.id, row.name, previous)
+          },
+        },
+        () => '撤销',
+      ),
+    ]),
+  })
+}
+
+/** 撤销移分类。产物就是一次普通的改归属，失败按普通错误提示，不做二次撤销。 */
+async function undoMove(docId: string, name: string, categoryId: number | null) {
+  try {
+    await updateDocument(docId, { categoryId })
+    ElMessage.success(`已把「${name}」移回${categoryLabel(categoryId)}`)
+    void load()
+    void loadCategories()
+  } catch (err) {
+    ElMessage.error(errorText(err))
+  }
+}
 </script>
 
 <template>
   <div class="documents-page">
     <aside class="category-aside">
       <CategoryTree v-model="categoryKey" :categories="categories" :loading="categoriesLoading"
-        :error="categoriesError" @changed="onCategoriesChanged" @retry="loadCategories" />
+        :error="categoriesError" :drop-key="dropCatKey" @changed="onCategoriesChanged"
+        @retry="loadCategories" />
     </aside>
 
     <div class="documents-content">
@@ -426,10 +617,36 @@ const selectedCategoryId = computed(() =>
 
         <!-- 数据 -->
         <template v-else>
-          <el-table :data="items" row-key="id" class="table" @row-click="openDetail">
+          <!-- pointerdown 挂在表格外面这一层，而不是 el-table 上：
+               el-table 会不会把原生事件透传到根节点，取决于它的 inheritAttrs 设置，
+               包一层是确定的，也让「委托到整个表格」这件事在模板里看得见 -->
+          <div class="table-wrap" @pointerdown="onTablePointerDown">
+          <el-table :data="items" row-key="id" class="table" @row-click="openDetail"
+            :row-class-name="rowClassName">
+            <!-- 抓手列：纯长按没有任何可见线索，而一个没人能发现的交互与不提供它
+                 是等价的（CategoryTree 里对删除按钮写过同一句话）。它是显式入口，
+                 按下即可拖；行内别处按住 380ms 同样能拖，两条路都留。 -->
+            <el-table-column v-if="tab !== 'trash'" width="34" class-name="col-grab">
+              <template #default>
+                <span v-if="dragEnabled" class="doc-grab" aria-label="拖动调整位置"
+                  title="按住拖动可调整位置，或拖到左侧分类上">
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <circle cx="6" cy="4.5" r="1.2" />
+                    <circle cx="6" cy="8" r="1.2" />
+                    <circle cx="6" cy="11.5" r="1.2" />
+                    <circle cx="10" cy="4.5" r="1.2" />
+                    <circle cx="10" cy="8" r="1.2" />
+                    <circle cx="10" cy="11.5" r="1.2" />
+                  </svg>
+                </span>
+              </template>
+            </el-table-column>
+
             <el-table-column label="文件名" min-width="240">
               <template #default="{ row }">
-                <div class="cell-name">
+                <!-- data-doc-id 是拖拽的行锚点：el-table 不给 tr 挂自定义属性，
+                     所以打在这一格上，需要行元素时再往上找它的 tr -->
+                <div class="cell-name" :data-doc-id="row.id">
                   <span class="name-text">{{ row.name }}</span>
                   <el-tag size="small" type="info" effect="plain" class="ext-tag">
                     {{ fileExtension(row.name).replace('.', '').toUpperCase() || '?' }}
@@ -486,6 +703,16 @@ const selectedCategoryId = computed(() =>
               </template>
             </el-table-column>
           </el-table>
+          </div>
+
+          <!-- 跟手的文件条。模板渲染而不是手工造 DOM：样式、字体、主题变量
+               跟着组件走，不用在 JS 里再写一份。
+               pointer-events: none 是必须的 —— 否则 elementFromPoint 只会命中它自己，
+               落点就永远算不出来。 -->
+          <div v-if="isDragging && draggingName" class="drag-ghost"
+            :style="{ left: `${dragGhost.x}px`, top: `${dragGhost.y}px` }">
+            {{ draggingName }}
+          </div>
 
           <el-pagination class="pager" background layout="total, sizes, prev, pager, next" :total="total"
             :current-page="page" :page-size="pageSize" :page-sizes="[10, 20, 50]"
@@ -566,6 +793,71 @@ const selectedCategoryId = computed(() =>
 /* 表格行可点击进入详情，给出指针反馈 */
 .table :deep(.el-table__row) {
   cursor: pointer;
+}
+
+/* 抓手：常显，且明确告诉用户「这里可以按住」。没有它的话，
+   长按拖拽是一个没有任何线索的手势。 */
+.doc-grab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: -4px;
+  border-radius: 4px;
+  color: var(--el-text-color-placeholder);
+  cursor: grab;
+  /* 触摸屏上按住拖动时，别让浏览器把它当成滚动 */
+  touch-action: none;
+}
+
+.doc-grab svg {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+}
+
+.doc-grab:hover {
+  background: var(--el-fill-color);
+  color: var(--el-text-color-regular);
+}
+
+/* 拖动期间整页统一指针：指针滑到行外时，抓手的形状会让人以为拖不动了 */
+:global(body.is-doc-dragging) {
+  cursor: grabbing;
+  /* 拖动过程中不该选出文字来 —— 表体里到处是文本节点 */
+  user-select: none;
+}
+
+/* 插入线。画在 td 上而不是 tr 上：表格行的 box-shadow 在各浏览器上渲染不一致。
+   target >= 行数 时标记最后一行，线就落在表格底部，不需要尾部占位元素。 */
+.table :deep(.el-table__row.is-drop-before > td) {
+  box-shadow: inset 0 2px 0 0 var(--el-color-primary) !important;
+}
+
+.table :deep(.el-table__row.is-drop-after > td) {
+  box-shadow: inset 0 -2px 0 0 var(--el-color-primary) !important;
+}
+
+.drag-ghost {
+  position: fixed;
+  z-index: 3000;
+  max-width: 260px;
+  padding: 4px 10px;
+  border: 1px solid var(--el-color-primary);
+  border-radius: 4px;
+  background: var(--el-bg-color);
+  color: var(--el-text-color-primary);
+  font-size: 12px;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: var(--el-box-shadow-light);
+  /* 见模板里的说明：不穿透的话落点判定只会命中它自己 */
+  pointer-events: none;
+  /* 稍微偏右下，别让文件条压住指针底下的那一行 */
+  transform: translate(12px, -50%);
 }
 
 .cell-name {

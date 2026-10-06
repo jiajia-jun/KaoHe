@@ -64,6 +64,8 @@ func NewRouter(cfg *config.Config, st *store.Store, files *storage.Store,
 		api.GET("/documents/:id/download", s.downloadDocument)
 		api.PATCH("/documents/:id", s.updateDocument)
 		api.POST("/documents/:id/reindex", s.reindexDocument)
+		// 拖动排序：把文件挪到另一份之后，缺省即置顶
+		api.POST("/documents/:id/position", s.moveDocument)
 
 		// 删除分两步：DELETE 移入回收站（可撤销），/purge 才是真的抹掉。
 		// 彻底删除只对回收站里的文件生效，所以想毁掉一份正在用的文件必须走两步 ——

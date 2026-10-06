@@ -87,6 +87,17 @@ export interface UploadOptions {
   onProgress?: (percent: number) => void
 }
 
+/**
+ * 一批上传的结果。
+ *
+ * 只带失败条数、不带失败明细：上传对话框会把每个失败行连同原因留在屏幕上，
+ * 调用方再弹一遍同样的内容只会重复；列表刷新只需要知道成功了几条。
+ */
+export interface UploadBatchResult {
+  succeeded: DocumentItem[]
+  failed: number
+}
+
 export async function uploadDocument(file: File, options: UploadOptions = {}): Promise<DocumentItem> {
   const form = new FormData()
   form.append('file', file)
@@ -124,6 +135,23 @@ export function archiveDocument(id: string): Promise<DocumentItem> {
 
 export function restoreDocument(id: string): Promise<DocumentItem> {
   return updateDocument(id, { archived: false })
+}
+
+/**
+ * 调整文件在列表里的位置：挪到 afterId 那份文件之后，传 null 表示置顶。
+ *
+ * 传的是**相对锚点**而不是下标：界面上的列表可能已经按分类、归档筛过一遍，
+ * 只是全局次序的一个子序列，「插到 B 之后」在这里只有一种解释，而下标
+ * 依赖调用方与服务端对「第几行」的理解完全一致，稍有不同步就会插错位置。
+ *
+ * 顺序是全局的：在分类视图里把一份文件拖到第一，它在「全部文件」里也到了最前。
+ */
+export async function moveDocument(id: string, afterId: string | null): Promise<DocumentItem> {
+  const { data } = await http.post<DocumentItem>(
+    `/documents/${encodeURIComponent(id)}/position`,
+    { afterId },
+  )
+  return data
 }
 
 /**

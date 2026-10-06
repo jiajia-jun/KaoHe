@@ -93,6 +93,18 @@ function resetDraft(target: DocumentItem) {
   editing.value = false
 }
 
+/**
+ * 索引在后台完成，抽屉里显示的状态会过时。
+ * 只要还停在待索引/索引中，就隔一会儿重新取一次详情；
+ * 状态落定（已索引 / 失败）就停下来，不在无人看的时候一直轮询。
+ *
+ * 声明必须放在下面那个 immediate 的 watch 之前：immediate 会在 setup 执行到
+ * 那一行时立刻跑一次，而它调用的 stopWatchingIndex 会读这个变量 ——
+ * 放在后面的话，`let` 还没初始化就被读到，整个组件会以
+ * 「Cannot access 'indexTimer' before initialization」报错并挂掉。
+ */
+let indexTimer: ReturnType<typeof setTimeout> | undefined
+
 watch(
   () => [props.modelValue, props.documentId],
   ([open]) => {
@@ -101,13 +113,6 @@ watch(
   },
   { immediate: true },
 )
-
-/**
- * 索引在后台完成，抽屉里显示的状态会过时。
- * 只要还停在待索引/索引中，就隔一会儿重新取一次详情；
- * 状态落定（已索引 / 失败）就停下来，不在无人看的时候一直轮询。
- */
-let indexTimer: ReturnType<typeof setTimeout> | undefined
 
 function stopWatchingIndex() {
   if (indexTimer) clearTimeout(indexTimer)

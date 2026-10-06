@@ -316,6 +316,62 @@ func (s *Server) restoreDocument(c *gin.Context) {
 	c.JSON(http.StatusOK, doc)
 }
 
+type moveDocumentRequest struct {
+	// 指针就够表达三种写法：不传、传 null、传一个标识 —— 前两者都是置顶。
+	AfterID *string `json:"afterId"`
+}
+
+// POST /api/v1/documents/:id/position
+//
+// 把文件挪到 afterId 指向的那份文件之后；afterId 缺省或为 null 表示置顶。
+//
+// 收相对锚点而不是绝对下标：筛选出来的列表只是全局序列的子序列，
+// 「插到 B 之后」在任何子序列里都只有一种解释；下标则要求调用方和我
+// 停在同一页、同一筛选条件上，稍有不同步就会插到别的地方去。
+func (s *Server) moveDocument(c *gin.Context) {
+	docUID := c.Param("id")
+	ctx := c.Request.Context()
+
+	// 先确认文档存在：在不存在的文档上「调整成功」没有任何意义
+	if _, err := s.store.GetDocument(ctx, docUID); err != nil {
+		s.respondLoadError(c, err)
+		return
+	}
+
+	var req moveDocumentRequest
+	// 允许空请求体，等价于置顶；只有真的带了 body 才去解析
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			fail(c, http.StatusBadRequest, codeBadRequest, "请求体不是合法的 JSON")
+			return
+		}
+	}
+	if req.AfterID != nil {
+		if after := strings.TrimSpace(*req.AfterID); after == "" {
+			req.AfterID = nil
+		} else {
+			req.AfterID = &after
+		}
+	}
+
+	// 落到自己身上不算错：store 会当成「没有变化」直接放行
+	if err := s.store.MoveDocumentAfter(ctx, docUID, req.AfterID); err != nil {
+		if errors.Is(err, store.ErrAnchorNotFound) {
+			fail(c, http.StatusBadRequest, codeBadRequest, "落点文件不存在")
+			return
+		}
+		s.respondLoadError(c, err)
+		return
+	}
+
+	doc, err := s.store.GetDocument(ctx, docUID)
+	if err != nil {
+		s.respondLoadError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, doc)
+}
+
 // DELETE /api/v1/documents/:id/purge
 //
 // 彻底删除：从库里删掉记录（片段与索引任务随外键一起消失），再清理磁盘目录。

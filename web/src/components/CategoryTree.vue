@@ -40,6 +40,8 @@ const props = defineProps<{
   categories: CategoryNode[]
   loading: boolean
   error: string
+  /** 拖拽悬停到的节点 key，用于高亮；由父组件在拖动过程中传入 */
+  dropKey?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -181,8 +183,13 @@ async function confirmDelete(node: TreeNode) {
       :expand-on-click-node="false" default-expand-all :indent="14" @node-click="onNodeClick">
       <template #default="{ data }">
         <!-- data-name 供端到端测试定位节点：el-tree 把子节点渲染在父节点的 DOM 内部，
-             按「包含某文本的节点」去找会同时命中外层祖先，需要一个精确的锚点 -->
-        <div class="node" :data-name="data.label">
+             按「包含某文本的节点」去找会同时命中外层祖先，需要一个精确的锚点。
+             data-cat-* 是拖拽的落点锚点：拖动逻辑按这几个属性从指针位置反查落在哪个节点上，
+             而不是把树的结构在父组件里再抄一份（抄一份就一定会有一天两边对不上）。
+             「全部文件」是视图不是分类，不参与 data-cat-mode 的落点判定。 -->
+        <div class="node" :data-name="data.label" :data-cat-key="data.key"
+          :data-cat-id="data.categoryId ?? ''" :data-cat-mode="data.mode"
+          :class="{ 'is-drop-target': props.dropKey === data.key }">
           <span class="node-label" :title="data.label">{{ data.label }}</span>
           <span v-if="data.count !== null" class="node-count">{{ data.count }}</span>
           <!-- 三个动作一律常显，不做成悬停才出现的「···」菜单。
@@ -246,6 +253,12 @@ async function confirmDelete(node: TreeNode) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 拖动时高亮命中的落点：整行铺满，否则只有文字那一小块变底色，看着像笔误 */
+.node.is-drop-target {
+    background: var(--el-color-primary-light-9);
+    box-shadow: inset 2px 0 0 var(--el-color-primary);
 }
 
 .node-count {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -19,6 +20,12 @@ var ErrNotFound = errors.New("记录不存在")
 // 必须先「移入回收站」再「彻底删除」两步。多出来的这一步不是仪式：
 // 它保证误删永远有一步可以停下来。
 var ErrNotTrashed = errors.New("文件不在回收站里")
+
+// ErrAnchorNotFound 表示拖动时指定的落点文件不存在，由 HTTP 层翻译成 400。
+//
+// 与被拖的文件不存在（ErrNotFound，404）分开：前者是调用方给错了锚点，
+// 后者是资源本身没了，两者的修法不一样。
+var ErrAnchorNotFound = errors.New("锚点文件不存在")
 
 // Store 是全部数据访问的入口：文档与分类走 GORM，
 // 检索、分类树、索引任务队列走原生 SQL（见 docs/DESIGN.md 的关键取舍）。
@@ -129,7 +136,7 @@ func (s *Store) ListDocuments(ctx context.Context, f ListFilter) ([]Document, in
 	listSQL := `SELECT d.*, c.name AS category_name
 FROM documents d
 LEFT JOIN categories c ON c.id = d.category_id` + where +
-		` ORDER BY d.created_at DESC, d.id DESC LIMIT ? OFFSET ?`
+		` ORDER BY d.sort_order, d.id DESC LIMIT ? OFFSET ?`
 	if err := s.db.WithContext(ctx).Raw(listSQL,
 		append(append([]any{}, args...), f.PageSize, offset)...,
 	).Scan(&items).Error; err != nil {
@@ -183,6 +190,18 @@ func (s *Store) scanDocument(ctx context.Context, query string, arg any) (*Docum
 // 文件就会永远停在 pending 且没有任何东西会去处理它。
 func (s *Store) CreateDocument(ctx context.Context, doc *Document, enqueueIndex bool) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 新文件排在最前，保住「最新的在上面」这个直觉。
+		//
+		// 这里刻意不加锁：并发两次上传会读到同一个 MIN，于是两个文件并列最前，
+		// 由 (sort_order, id DESC) 分出先后，下一次上传再把 MIN 继续往下推。
+		// 并列是无害的 —— 这正是 sort_order 上不加唯一约束的原因（0004 迁移里有说明）。
+		var next int64
+		if err := tx.Raw(
+			`SELECT COALESCE(MIN(sort_order), 1) - 1 FROM documents`).Row().Scan(&next); err != nil {
+			return fmt.Errorf("计算文档排序位置失败: %w", err)
+		}
+		doc.SortOrder = next
+
 		if err := tx.Create(doc).Error; err != nil {
 			return fmt.Errorf("写入文档记录失败: %w", err)
 		}
@@ -223,6 +242,108 @@ func (s *Store) UpdateDocument(ctx context.Context, docUID string, fields map[st
 		}
 	}
 	return s.GetDocument(ctx, docUID)
+}
+
+// MoveDocumentAfter 把一份文件挪到另一份之后，afterUID 为 nil 表示置顶。
+//
+// 读的是全表而不是界面上那一页：顺序是整张表一条序列，筛选视图只是它的子序列，
+// 「插到 B 之后」只有放在全局序列里才有唯一定义。接口因此收的是相对锚点而非绝对下标。
+//
+// 整表重排，而不是留间隔、按中点插入：中点方案在反复插到同一处（比如一直往最前面拖）
+// 会耗尽间隔，需要一条「间隔不够了就重排一遍」的分支 —— 那条分支平时跑不到，
+// 真跑起来恰恰是最需要正确的时候。这里每次走的都是同一条路径，代价是 O(n) 行写入，
+// 在几百到几千份文档这个量级上可以忽略。
+func (s *Store) MoveDocumentAfter(ctx context.Context, docUID string, afterUID *string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		type ordered struct {
+			ID     int64  `gorm:"column:id"`
+			DocUID string `gorm:"column:doc_uid"`
+		}
+
+		// 行级 FOR UPDATE，而不是 LOCK TABLE：这个仓库里的加锁惯例是前者。
+		// 整表按同一个 ORDER BY 取行，于是并发拖动既会串行、加锁顺序又一致，不会互相死锁 ——
+		// 若各读一份顺序再各自写回，后写的会把先写的整个盖掉。
+		var rows []ordered
+		if err := tx.Raw(
+			`SELECT id, doc_uid FROM documents ORDER BY sort_order, id DESC FOR UPDATE`,
+		).Scan(&rows).Error; err != nil {
+			return fmt.Errorf("读取文档顺序失败: %w", err)
+		}
+
+		from := -1
+		for i, row := range rows {
+			if row.DocUID == docUID {
+				from = i
+				break
+			}
+		}
+		if from < 0 {
+			return ErrNotFound
+		}
+
+		// 锚点就是自己：没得可挪。必须在摘除之前判断 —— 摘除之后自己已经不在
+		// 待查的行里，会当成「锚点不存在」误报成 400。
+		if afterUID != nil && *afterUID == docUID {
+			return nil
+		}
+
+		// 先把被拖的行摘出来，再在剩下的行里找锚点：
+		// 否则「拖到紧挨着自己前面/后面」会算出一个差一格的位置。
+		rest := make([]ordered, 0, len(rows)-1)
+		rest = append(rest, rows[:from]...)
+		rest = append(rest, rows[from+1:]...)
+
+		at := 0 // 没有锚点就是置顶
+		if afterUID != nil {
+			anchor := -1
+			for i, row := range rest {
+				if row.DocUID == *afterUID {
+					anchor = i
+					break
+				}
+			}
+			if anchor < 0 {
+				return ErrAnchorNotFound
+			}
+			at = anchor + 1
+		}
+
+		next := make([]ordered, 0, len(rows))
+		next = append(next, rest[:at]...)
+		next = append(next, rows[from])
+		next = append(next, rest[at:]...)
+
+		// 落点即原位：不去写库。拖动落回原处、或客户端重发一次同样的请求，都不该动数据。
+		moved := false
+		for i, row := range next {
+			if row.ID != rows[i].ID {
+				moved = true
+				break
+			}
+		}
+		if !moved {
+			return nil
+		}
+
+		ids := make([]int64, len(next))
+		for i, row := range next {
+			ids[i] = row.ID
+		}
+
+		// 一条语句写回整条序列：WITH ORDINALITY 自带 1..n 的序号，
+		// 于是只需要传一个新序的 id 数组，序号天然稠密。
+		//
+		// 只写 sort_order，不碰 updated_at —— 挪位置不是内容变更，
+		// 顺手把「更新时间」也改掉属于撒谎。
+		if err := tx.Exec(`
+UPDATE documents AS d
+SET sort_order = t.ord
+FROM unnest(?::bigint[]) WITH ORDINALITY AS t(id, ord)
+WHERE d.id = t.id`, pq.Int64Array(ids)).Error; err != nil {
+			return fmt.Errorf("写入文档顺序失败: %w", err)
+		}
+		return nil
+	})
 }
 
 // SoftDeleteDocument 把文件移进回收站。

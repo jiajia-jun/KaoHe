@@ -69,6 +69,12 @@ type Document struct {
 	IndexStatus   string     `gorm:"column:index_status" json:"indexStatus"`
 	IndexError    *string    `gorm:"column:index_error" json:"indexError"`
 
+	// SortOrder 是用户在列表里拖出来的全局次序：整张表只有这一条序列，
+	// 归档区、回收站、某个分类的列表都是它的子序列，因此归档或删除都不动它 ——
+	// 恢复出来仍回原位。值保持稠密（1..n），并列时由 id 兜底，所以不加唯一约束。
+	// 不对外暴露：顺序已经体现在返回的排列里，再给一个数字只会让人以为要自己算。
+	SortOrder int64 `gorm:"column:sort_order" json:"-"`
+
 	CreatedAt time.Time `gorm:"column:created_at" json:"createdAt"`
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"updatedAt"`
 
